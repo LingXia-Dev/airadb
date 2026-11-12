@@ -296,6 +296,18 @@ impl AdbSync {
         }
     }
 
+    /// Pushes in-memory bytes to a remote file path.
+    pub async fn push_bytes(
+        &mut self,
+        bytes: &[u8],
+        remote_path: &str,
+        mode: u32,
+        mtime: u32,
+    ) -> Result<u64> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        self.push(&mut cursor, remote_path, mode, mtime).await
+    }
+
     /// Pushes a local file to a remote file path.
     pub async fn push_file<P: AsRef<Path>>(
         &mut self,

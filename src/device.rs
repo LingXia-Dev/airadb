@@ -1,14 +1,33 @@
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::ToSocketAddrs;
+use tokio::time::timeout;
 
 use crate::connection::AdbConnection;
 use crate::crypto::AdbKeyPair;
 use crate::error::{AdbError, Result};
 use crate::stream::AdbStream;
-use crate::sync::{AdbSync, SyncDent, SyncStat};
+use crate::sync::{AdbSync, SyncDent, SyncStat, DEFAULT_FILE_MODE};
+
+/// Output of an ADB shell command, providing stdout and stderr buffers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShellOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl ShellOutput {
+    pub fn stdout_string_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stdout).to_string()
+    }
+
+    pub fn stderr_string_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).to_string()
+    }
+}
 
 /// Reboot target modes for ADB device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +50,19 @@ impl fmt::Display for RebootMode {
             Self::Recovery => write!(f, "recovery"),
             Self::Sideload => write!(f, "sideload"),
         }
+    }
+}
+
+/// Pads command with a trailing space if missing.
+///
+/// Workaround for older Android adbd transports (specifically on Android 5)
+/// that sometimes drop the last byte of a command payload.
+fn format_padded_cmd(prefix: &str, command: &str) -> String {
+    let trimmed = command.trim_end_matches('\0');
+    if !trimmed.ends_with(char::is_whitespace) {
+        format!("{}{} \0", prefix, trimmed)
+    } else {
+        format!("{}{}\0", prefix, trimmed)
     }
 }
 
@@ -95,18 +127,47 @@ impl AdbDevice {
         self.connection.open_stream(destination).await
     }
 
-    /// Executes a shell command on the device and returns its combined output.
+    /// Executes a shell command on the device and returns its combined output as a String.
     ///
-    /// Uses the persistent TCP connection without reconnecting.
+    /// Automatically applies Android 5 command padding safety to prevent last-byte truncation.
     pub async fn shell(&self, command: &str) -> Result<String> {
-        let dest = format!("shell:{}", command);
+        let dest = format_padded_cmd("shell:", command);
         let mut stream = self.open_stream(&dest).await?;
         stream.read_string_lossy().await
     }
 
+    /// Executes a shell command and returns raw output bytes.
+    pub async fn shell_bytes(&self, command: &str) -> Result<Vec<u8>> {
+        let dest = format_padded_cmd("shell:", command);
+        let mut stream = self.open_stream(&dest).await?;
+        stream.read_all().await
+    }
+
+    /// Executes a shell command and returns `ShellOutput` (stdout + stderr).
+    ///
+    /// Note: On Android < 7 without `shell_v2`, adbd sends combined stdout and stderr
+    /// over the PTY, returned here in `stdout`.
+    pub async fn shell_output(&self, command: &str) -> Result<ShellOutput> {
+        let stdout = self.shell_bytes(command).await?;
+        Ok(ShellOutput {
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+
+    /// Executes a shell command with a timeout duration.
+    pub async fn shell_timeout(&self, command: &str, duration: Duration) -> Result<String> {
+        timeout(duration, self.shell(command)).await.map_err(|_| {
+            AdbError::Timeout(format!(
+                "Command '{}' timed out after {:?}",
+                command, duration
+            ))
+        })?
+    }
+
     /// Starts a shell command and returns an `AdbStream` for streaming input and output.
     pub async fn shell_stream(&self, command: &str) -> Result<AdbStream> {
-        let dest = format!("shell:{}", command);
+        let dest = format_padded_cmd("shell:", command);
         self.open_stream(&dest).await
     }
 
@@ -119,15 +180,63 @@ impl AdbDevice {
     ///
     /// Ideal for pulling binary output such as `screencap -p`.
     pub async fn exec(&self, command: &str) -> Result<Vec<u8>> {
-        let dest = format!("exec:{}", command);
+        let dest = format_padded_cmd("exec:", command);
         let mut stream = self.open_stream(&dest).await?;
         stream.read_all().await
     }
 
     /// Starts an exec command and returns an `AdbStream`.
     pub async fn exec_stream(&self, command: &str) -> Result<AdbStream> {
-        let dest = format!("exec:{}", command);
+        let dest = format_padded_cmd("exec:", command);
         self.open_stream(&dest).await
+    }
+
+    /// Pumps asynchronous `stdin` into a remote `exec:` command and writes remote output into `stdout`.
+    ///
+    /// Perfect for running long-running daemons with NDJSON / streaming RPC.
+    pub async fn exec_pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &self,
+        command: &str,
+        stdin: &mut R,
+        stdout: &mut W,
+    ) -> Result<()> {
+        let stream = self.exec_stream(command).await?;
+        let (mut stream_r, mut stream_w) = tokio::io::split(stream);
+
+        tokio::select! {
+            res1 = tokio::io::copy(stdin, &mut stream_w) => {
+                let _ = res1?;
+                let _ = stream_w.shutdown().await;
+                let _ = tokio::io::copy(&mut stream_r, stdout).await?;
+            }
+            res2 = tokio::io::copy(&mut stream_r, stdout) => {
+                let _ = res2?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pumps asynchronous `stdin` into a remote `shell:` command and writes remote output into `stdout`.
+    pub async fn shell_pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &self,
+        command: &str,
+        stdin: &mut R,
+        stdout: &mut W,
+    ) -> Result<()> {
+        let stream = self.shell_stream(command).await?;
+        let (mut stream_r, mut stream_w) = tokio::io::split(stream);
+
+        tokio::select! {
+            res1 = tokio::io::copy(stdin, &mut stream_w) => {
+                let _ = res1?;
+                let _ = stream_w.shutdown().await;
+                let _ = tokio::io::copy(&mut stream_r, stdout).await?;
+            }
+            res2 = tokio::io::copy(&mut stream_r, stdout) => {
+                let _ = res2?;
+            }
+        }
+        Ok(())
     }
 
     /// Retrieves an Android system property using `getprop`.
@@ -196,6 +305,24 @@ impl AdbDevice {
     pub async fn sync(&self) -> Result<AdbSync> {
         let stream = self.open_stream("sync:").await?;
         Ok(AdbSync::new(stream))
+    }
+
+    /// Pushes in-memory bytes directly to a remote path on the device.
+    pub async fn push_bytes(&self, bytes: &[u8], remote_path: &str) -> Result<u64> {
+        self.push_bytes_with_mode(bytes, remote_path, DEFAULT_FILE_MODE).await
+    }
+
+    /// Pushes in-memory bytes with a specific file permission mode to a remote path.
+    pub async fn push_bytes_with_mode(
+        &self,
+        bytes: &[u8],
+        remote_path: &str,
+        mode: u32,
+    ) -> Result<u64> {
+        let mut sync = self.sync().await?;
+        let n = sync.push_bytes(bytes, remote_path, mode, 0).await?;
+        let _ = sync.quit().await;
+        Ok(n)
     }
 
     /// Pushes a local file to a remote path on the device.

@@ -237,6 +237,43 @@ pub fn load_or_generate_default_key() -> Result<AdbKeyPair> {
     }
 }
 
+/// Loads a keypair from a file or directory path (such as `.adb_home`), generating one if absent.
+pub fn load_or_create_from_path<P: AsRef<Path>>(path: P) -> Result<AdbKeyPair> {
+    let p = path.as_ref();
+    if p.is_dir() {
+        // Try known key filenames in directory
+        let candidates = [
+            p.join("adbkey"),
+            p.join(".android").join("adbkey"),
+        ];
+        for candidate in &candidates {
+            if candidate.exists() {
+                if let Ok(key) = AdbKeyPair::from_file(candidate) {
+                    return Ok(key);
+                }
+            }
+        }
+        // None found in directory, create in p/adbkey
+        let key_path = p.join("adbkey");
+        let key = AdbKeyPair::generate()?;
+        let _ = key.save_to_file(&key_path);
+        if let Ok(pub_str) = key.android_pubkey_string("radb@client") {
+            let _ = fs::write(key_path.with_extension("pub"), pub_str.trim_end_matches('\0'));
+        }
+        Ok(key)
+    } else if p.exists() {
+        AdbKeyPair::from_file(p)
+    } else {
+        // File doesn't exist yet, generate and save
+        let key = AdbKeyPair::generate()?;
+        let _ = key.save_to_file(p);
+        if let Ok(pub_str) = key.android_pubkey_string("radb@client") {
+            let _ = fs::write(p.with_extension("pub"), pub_str.trim_end_matches('\0'));
+        }
+        Ok(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
