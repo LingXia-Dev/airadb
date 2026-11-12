@@ -62,6 +62,13 @@ enum Commands {
         local: Option<PathBuf>,
     },
 
+    /// Capture a screenshot from the device and save as PNG
+    Screencap {
+        /// Destination local file path (defaults to "screenshot.png")
+        #[arg(default_value = "screenshot.png")]
+        out: PathBuf,
+    },
+
     /// Get file metadata (stat)
     Stat {
         /// Remote file path
@@ -360,6 +367,26 @@ async fn main() {
                 Ok(bytes) => println!("Received {} bytes successfully.", bytes),
                 Err(e) => {
                     eprintln!("Pull failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Screencap { out } => {
+            println!("Capturing screenshot from {}...", cli.server);
+            match device.screencap().await {
+                Ok(png_bytes) => {
+                    if let Err(e) = tokio::fs::write(&out, &png_bytes).await {
+                        eprintln!("Failed to write screenshot to {}: {}", out.display(), e);
+                        process::exit(1);
+                    }
+                    println!(
+                        "Saved screenshot ({} bytes) to {}",
+                        png_bytes.len(),
+                        out.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Screenshot failed: {}", e);
                     process::exit(1);
                 }
             }

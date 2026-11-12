@@ -183,9 +183,12 @@ async fn test_device_high_level_api_and_sync() {
     let sdk = device.get_sdk_version().await.unwrap();
     assert_eq!(sdk, 21); // Android 5.0!
 
-    // 2. Exec command (raw binary)
+    // 2. Exec command (raw binary) and Screencap
     let png_header = device.exec("screencap -p").await.unwrap();
     assert_eq!(&png_header[0..4], &[0x89, 0x50, 0x4e, 0x47]);
+
+    let screencap_bytes = device.screencap().await.unwrap();
+    assert_eq!(&screencap_bytes[0..8], b"\x89PNG\r\n\x1a\n");
 
     // 3. Remount
     let remount_out = device.remount().await.unwrap();

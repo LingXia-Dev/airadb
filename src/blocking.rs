@@ -51,6 +51,31 @@ impl BlockingDevicePool {
         })
     }
 
+    /// Executes a shell command synchronously and validates its exit code.
+    pub fn shell_checked(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+        command: &str,
+    ) -> Result<String> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.shell_checked(addr, Some(&key), command))
+    }
+
+    /// Checks if an executable command exists in PATH on `addr`.
+    pub fn has_command(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+        cmd: &str,
+    ) -> bool {
+        if let Ok(key) = load_or_create_from_path(key_path) {
+            get_runtime().block_on(self.pool.has_command(addr, Some(&key), cmd))
+        } else {
+            false
+        }
+    }
+
     /// Pushes in-memory bytes to `remote_path` on `addr` synchronously.
     pub fn push(
         &self,
@@ -147,6 +172,45 @@ impl BlockingDevicePool {
         let _ = stdout_thread.join();
 
         Ok(())
+    }
+
+    /// Captures a screenshot from `addr` synchronously, returning PNG bytes.
+    pub fn screencap(&self, addr: SocketAddr, key_path: &Path) -> Result<Vec<u8>> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.screencap(addr, Some(&key)))
+    }
+
+    /// Pulls a remote file from `addr` directly into memory.
+    pub fn pull_bytes(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+        remote_path: &str,
+    ) -> Result<Vec<u8>> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.pull_bytes(addr, Some(&key), remote_path))
+    }
+
+    /// Installs an APK on `addr` synchronously from a local file path.
+    pub fn install_apk<P: AsRef<Path>>(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+        local_apk_path: P,
+    ) -> Result<()> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.install_apk(addr, Some(&key), local_apk_path))
+    }
+
+    /// Installs an APK on `addr` synchronously directly from in-memory bytes.
+    pub fn install_apk_bytes(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+        apk_bytes: &[u8],
+    ) -> Result<()> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.install_apk_bytes(addr, Some(&key), apk_bytes))
     }
 
     /// Scans the local network for ADB devices synchronously.

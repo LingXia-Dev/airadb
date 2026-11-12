@@ -165,6 +165,51 @@ impl AdbDevice {
         })?
     }
 
+    /// Executes a shell command and validates its exit code.
+    ///
+    /// Since Android 5.0 (ADB v1) does not separate stdout/stderr/exitcode in `shell:`,
+    /// this appends an exit code probe marker to detect command failures, unknown commands,
+    /// and non-zero exit statuses.
+    pub async fn shell_checked(&self, command: &str) -> Result<String> {
+        let marker = "__AIRADB_EXIT_STATUS__";
+        let wrapped_cmd = format!("{}; echo \"\n{}:$?\"", command.trim(), marker);
+        let raw_output = self.shell(&wrapped_cmd).await?;
+
+        if let Some(pos) = raw_output.rfind(marker) {
+            let output_part = raw_output[..pos].trim_end();
+            let exit_part = raw_output[pos + marker.len()..]
+                .trim()
+                .trim_start_matches(':');
+            let exit_code: i32 = exit_part
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse()
+                .unwrap_or(0);
+
+            if exit_code != 0 {
+                return Err(AdbError::CommandFailed(format!(
+                    "Command exited with code {}: {}",
+                    exit_code,
+                    output_part.trim()
+                )));
+            }
+            Ok(output_part.to_string())
+        } else {
+            Ok(raw_output)
+        }
+    }
+
+    /// Checks if a specific executable command exists in PATH on the target device.
+    pub async fn has_command(&self, cmd: &str) -> bool {
+        let probe = format!(
+            "command -v \"{}\" >/dev/null 2>&1 || which \"{}\" >/dev/null 2>&1",
+            cmd, cmd
+        );
+        self.shell_checked(&probe).await.is_ok()
+    }
+
     /// Starts a shell command and returns an `AdbStream` for streaming input and output.
     pub async fn shell_stream(&self, command: &str) -> Result<AdbStream> {
         let dest = format_padded_cmd("shell:", command);
@@ -365,6 +410,54 @@ impl AdbDevice {
         Ok(entries)
     }
 
+    /// Pulls a remote file directly into an in-memory byte buffer.
+    pub async fn pull_bytes(&self, remote_path: &str) -> Result<Vec<u8>> {
+        let mut sync = self.sync().await?;
+        let mut buf = Vec::new();
+        sync.pull(remote_path, &mut buf).await?;
+        let _ = sync.quit().await;
+        Ok(buf)
+    }
+
+    /// Captures a screenshot from the device as PNG encoded bytes.
+    ///
+    /// First attempts `exec:screencap -p` for fast direct streaming without disk I/O.
+    /// If `exec:` is unsupported on legacy devices (e.g. Android 5.0), falls back to
+    /// capturing to a temporary file via `shell:` and pulling it via binary `sync:`.
+    pub async fn screencap(&self) -> Result<Vec<u8>> {
+        const PNG_HEADER: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+        // Try direct streaming via exec: first (fastest, no disk wear)
+        if let Ok(raw_png) = self.exec("screencap -p").await {
+            if raw_png.len() >= 8 && &raw_png[..8] == PNG_HEADER {
+                return Ok(raw_png);
+            }
+        }
+
+        // Fallback for Android 5.0 devices lacking exec: service
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let remote_tmp_png = format!("/data/local/tmp/airadb_shot_{}.png", now);
+
+        // Run screencap to temporary remote file
+        let _ = self.shell(&format!("screencap -p \"{}\"", remote_tmp_png)).await?;
+
+        // Pull binary file directly into memory
+        let png_res = self.pull_bytes(&remote_tmp_png).await;
+
+        // Cleanup temporary remote file
+        let _ = self.shell(&format!("rm -f \"{}\"", remote_tmp_png)).await;
+
+        let png_bytes = png_res?;
+        if png_bytes.len() >= 8 && &png_bytes[..8] == PNG_HEADER {
+            Ok(png_bytes)
+        } else {
+            Err(AdbError::Protocol("Captured screenshot data is not valid PNG format".into()))
+        }
+    }
+
     /// Installs an APK on the device.
     ///
     /// Pushes the APK to `/data/local/tmp/` via the sync service, executes `pm install`,
@@ -377,6 +470,33 @@ impl AdbDevice {
         let remote_tmp_apk = format!("/data/local/tmp/airadb_pkg_{}.apk", now);
 
         self.push_file(local_apk_path, &remote_tmp_apk).await?;
+
+        let install_cmd = format!("pm install -r \"{}\"", remote_tmp_apk);
+        let output = self.shell(&install_cmd).await;
+
+        // Cleanup temporary APK file
+        let _ = self.shell(&format!("rm -f \"{}\"", remote_tmp_apk)).await;
+
+        let output = output?;
+        if output.contains("Success") {
+            Ok(())
+        } else {
+            Err(AdbError::CommandFailed(format!(
+                "pm install failed: {}",
+                output.trim()
+            )))
+        }
+    }
+
+    /// Installs an APK directly from an in-memory byte buffer without local temporary files.
+    pub async fn install_apk_bytes(&self, apk_bytes: &[u8]) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let remote_tmp_apk = format!("/data/local/tmp/airadb_pkg_{}.apk", now);
+
+        self.push_bytes(apk_bytes, &remote_tmp_apk).await?;
 
         let install_cmd = format!("pm install -r \"{}\"", remote_tmp_apk);
         let output = self.shell(&install_cmd).await;

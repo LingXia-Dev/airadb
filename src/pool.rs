@@ -62,6 +62,31 @@ impl DevicePool {
         dev.shell(command).await
     }
 
+    /// Executes a shell command on `addr` and validates its exit code.
+    pub async fn shell_checked(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+        command: &str,
+    ) -> Result<String> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.shell_checked(command).await
+    }
+
+    /// Checks if a command exists in PATH on `addr`.
+    pub async fn has_command(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+        cmd: &str,
+    ) -> bool {
+        if let Ok(dev) = self.get_or_connect(addr, key).await {
+            dev.has_command(cmd).await
+        } else {
+            false
+        }
+    }
+
     /// Executes a shell command on `addr` returning `ShellOutput` (stdout & stderr).
     pub async fn shell_output(
         &self,
@@ -96,6 +121,49 @@ impl DevicePool {
     ) -> Result<()> {
         let dev = self.get_or_connect(addr, key).await?;
         dev.exec_pump(command, stdin, stdout).await
+    }
+
+    /// Captures a screenshot from `addr` as PNG bytes, reusing the connection.
+    pub async fn screencap(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+    ) -> Result<Vec<u8>> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.screencap().await
+    }
+
+    /// Pulls a remote file from `addr` directly into memory.
+    pub async fn pull_bytes(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+        remote_path: &str,
+    ) -> Result<Vec<u8>> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.pull_bytes(remote_path).await
+    }
+
+    /// Installs an APK on `addr` from a local file path.
+    pub async fn install_apk<P: AsRef<std::path::Path>>(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+        local_apk_path: P,
+    ) -> Result<()> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.install_apk(local_apk_path).await
+    }
+
+    /// Installs an APK on `addr` directly from in-memory bytes.
+    pub async fn install_apk_bytes(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+        apk_bytes: &[u8],
+    ) -> Result<()> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.install_apk_bytes(apk_bytes).await
     }
 
     /// Closes all active connections in the pool.
