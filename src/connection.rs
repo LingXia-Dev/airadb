@@ -45,6 +45,14 @@ impl AdbConnection {
         let stream = TcpStream::connect(addr).await?;
         let _ = stream.set_nodelay(true);
 
+        // Configure TCP keepalive to maintain the long-lived connection through NAT/routers
+        // and quickly detect broken links.
+        let sock_ref = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(15))
+            .with_interval(std::time::Duration::from_secs(5));
+        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+
         Self::connect_with_stream(stream, key).await
     }
 

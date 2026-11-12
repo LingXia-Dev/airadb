@@ -520,6 +520,7 @@ dependencies = [
  "num-traits",
  "rsa",
  "sha1",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",
