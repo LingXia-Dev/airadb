@@ -117,21 +117,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### 4. Custom Key Management
+### 4. In-Memory Byte Push & Device Connection Pool
+
+For tools that manage multiple devices (like `mukeinstall`), `radb` provides `DevicePool` and `BlockingDevicePool` which maintain persistent connections by `SocketAddr`:
 
 ```rust
-use radb::crypto::AdbKeyPair;
-use radb::AdbDevice;
+use radb::pool::DevicePool;
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Generate an in-memory key or load from custom file
-    let key = AdbKeyPair::from_file("/path/to/custom_key")?;
+    let pool = DevicePool::new();
+    let addr: SocketAddr = "192.168.1.100:5555".parse()?;
 
-    let device = AdbDevice::connect_with_key("192.168.1.100:5555", &key).await?;
-    println!("Connected using custom key!");
+    // Push in-memory binary without temporary files
+    let agent_bytes = include_bytes!("../assets/muke-util");
+    pool.push_bytes(addr, None, agent_bytes, "/data/local/tmp/muke-util").await?;
+
+    // Subsequent commands reuse the same existing connection
+    let model = pool.shell(addr, None, "getprop ro.product.model").await?;
+    println!("Model: {}", model.trim());
 
     Ok(())
+}
+```
+
+### 5. Synchronous / Blocking API (for FFI / Non-Async Traits)
+
+If your app uses synchronous traits (e.g. `mukeinstall-lib`'s `AdbBackend`), you can use `radb::blocking::BlockingDevicePool`:
+
+```rust
+use radb::blocking::BlockingDevicePool;
+use std::net::SocketAddr;
+use std::path::Path;
+
+fn run_sync(addr: SocketAddr, key_path: &Path) {
+    let pool = BlockingDevicePool::new();
+
+    // Directly call synchronous methods from any thread
+    let output = pool.shell(addr, key_path, "uname -a").unwrap();
+    println!("Stdout: {}", output.stdout_string_lossy());
+
+    pool.push(addr, key_path, b"data", "/data/local/tmp/test.txt").unwrap();
 }
 ```
 
