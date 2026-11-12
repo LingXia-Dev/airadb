@@ -166,6 +166,26 @@ impl DevicePool {
         dev.install_apk_bytes(apk_bytes).await
     }
 
+    /// Queries detailed device hardware info from `addr`.
+    pub async fn get_hardware_info(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+    ) -> Result<crate::info::DeviceHardwareInfo> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.get_hardware_info().await
+    }
+
+    /// Queries the 64-bit unique Android ID from `addr`.
+    pub async fn get_android_id(
+        &self,
+        addr: SocketAddr,
+        key: Option<&AdbKeyPair>,
+    ) -> Result<Option<String>> {
+        let dev = self.get_or_connect(addr, key).await?;
+        dev.get_android_id().await
+    }
+
     /// Closes all active connections in the pool.
     pub async fn clear(&self) {
         let mut map = self.devices.lock().await;

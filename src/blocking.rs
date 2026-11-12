@@ -213,6 +213,26 @@ impl BlockingDevicePool {
         get_runtime().block_on(self.pool.install_apk_bytes(addr, Some(&key), apk_bytes))
     }
 
+    /// Queries detailed device hardware info synchronously.
+    pub fn get_hardware_info(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+    ) -> Result<crate::info::DeviceHardwareInfo> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.get_hardware_info(addr, Some(&key)))
+    }
+
+    /// Queries the 64-bit unique Android ID synchronously.
+    pub fn get_android_id(
+        &self,
+        addr: SocketAddr,
+        key_path: &Path,
+    ) -> Result<Option<String>> {
+        let key = load_or_create_from_path(key_path)?;
+        get_runtime().block_on(self.pool.get_android_id(addr, Some(&key)))
+    }
+
     /// Scans the local network for ADB devices synchronously.
     pub fn scan(
         &self,

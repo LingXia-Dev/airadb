@@ -32,6 +32,9 @@ enum Commands {
     /// Test connection and authenticate with device
     Connect,
 
+    /// Query comprehensive device hardware info (CPU, RAM, storage, Android version, GPU)
+    Info,
+
     /// Run a shell command or start an interactive shell
     Shell {
         /// Command and arguments to execute
@@ -299,6 +302,15 @@ async fn main() {
                 println!("SDK API:       {}", sdk);
             }
             println!("Max payload:   {} bytes", device.max_payload());
+        }
+        Commands::Info => {
+            match device.get_hardware_info().await {
+                Ok(info) => println!("{}", info),
+                Err(e) => {
+                    eprintln!("Failed to get device hardware info: {}", e);
+                    process::exit(1);
+                }
+            }
         }
         Commands::Shell { command } => {
             if command.is_empty() {

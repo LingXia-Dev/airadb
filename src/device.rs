@@ -308,6 +308,25 @@ impl AdbDevice {
             .map_err(|e| AdbError::Protocol(format!("Failed to parse SDK version '{}': {}", val, e)))
     }
 
+    /// Queries detailed device hardware info (CPU, memory, storage, Android version, Android ID).
+    pub async fn get_hardware_info(&self) -> Result<crate::info::DeviceHardwareInfo> {
+        crate::info::query_device_hardware_info(self).await
+    }
+
+    /// Queries the 64-bit unique Android ID (`settings get secure android_id`).
+    pub async fn get_android_id(&self) -> Result<Option<String>> {
+        let out = self.shell("settings get secure android_id").await?;
+        let trimmed = out.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("null")
+            || trimmed.contains("not found")
+        {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
     /// Reboots the device into the specified `RebootMode`.
     pub async fn reboot(&self, mode: RebootMode) -> Result<()> {
         let mode_str = mode.to_string();

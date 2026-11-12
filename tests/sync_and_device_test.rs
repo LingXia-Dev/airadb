@@ -60,6 +60,12 @@ async fn test_device_high_level_api_and_sync() {
                     let _ = read_packet(&mut socket, false).await.unwrap();
                     let clse = AdbPacket::new(A_CLSE, remote_id, local_id, Vec::new());
                     write_packet(&mut socket, &clse).await.unwrap();
+                } else if dest_clean.starts_with("shell:settings get secure android_id") {
+                    let wrte = AdbPacket::new(A_WRTE, remote_id, local_id, b"9774d56d682e549c\n".to_vec());
+                    write_packet(&mut socket, &wrte).await.unwrap();
+                    let _ = read_packet(&mut socket, false).await.unwrap();
+                    let clse = AdbPacket::new(A_CLSE, remote_id, local_id, Vec::new());
+                    write_packet(&mut socket, &clse).await.unwrap();
                 } else if dest_clean.starts_with("exec:screencap") {
                     let raw_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
                     let wrte = AdbPacket::new(A_WRTE, remote_id, local_id, raw_bytes);
@@ -182,6 +188,9 @@ async fn test_device_high_level_api_and_sync() {
 
     let sdk = device.get_sdk_version().await.unwrap();
     assert_eq!(sdk, 21); // Android 5.0!
+
+    let aid = device.get_android_id().await.unwrap();
+    assert_eq!(aid.as_deref(), Some("9774d56d682e549c"));
 
     // 2. Exec command (raw binary) and Screencap
     let png_header = device.exec("screencap -p").await.unwrap();

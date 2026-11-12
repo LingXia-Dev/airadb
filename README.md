@@ -211,6 +211,12 @@ airadb scan --subnet 192.168.1.0/24 --ports 5555,55555
 # Test connection and show device info
 airadb -s 192.168.1.100:5555 connect
 
+# Query comprehensive hardware info (CPU, RAM, storage, Android OS, GPU)
+airadb -s 192.168.1.100:5555 info
+
+# Capture screenshot directly
+airadb -s 192.168.1.100:5555 screencap screen.png
+
 # Run a shell command
 airadb -s 192.168.1.100:5555 shell getprop ro.product.model
 
