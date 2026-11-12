@@ -162,6 +162,25 @@ fn run_sync(addr: SocketAddr, key_path: &Path) {
 }
 ```
 
+### 6. Local Network Device Discovery (TCP Probe)
+
+Discover ADB devices on your local network without relying on ICMP ping (which is frequently blocked by TV boxes and router isolation):
+
+```rust
+use radb::scan::{scan_devices, ScanOptions};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Automatically detects local subnet (e.g. 192.168.1.0/24) and probes port 5555
+    let devices = scan_devices(ScanOptions::default()).await?;
+
+    for dev in devices {
+        println!("Found: {} model={:?} auth={}", dev.addr, dev.model, dev.authorized);
+    }
+    Ok(())
+}
+```
+
 ---
 
 ## CLI Tool
@@ -183,6 +202,12 @@ cargo install --path .
 ### Examples
 
 ```bash
+# Scan local network for ADB devices (auto-detects subnet, probes port 5555)
+radb scan
+
+# Scan custom subnet and specific ports
+radb scan --subnet 192.168.1.0/24 --ports 5555,55555
+
 # Test connection and show device info
 radb -s 192.168.1.100:5555 connect
 

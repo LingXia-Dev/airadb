@@ -148,4 +148,23 @@ impl BlockingDevicePool {
 
         Ok(())
     }
+
+    /// Scans the local network for ADB devices synchronously.
+    pub fn scan(
+        &self,
+        subnet: Option<&str>,
+        ports: Option<&[u16]>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<crate::scan::DiscoveredDevice>> {
+        let options = crate::scan::ScanOptions {
+            subnet: subnet.map(|s| s.to_string()),
+            candidates: None,
+            ports: ports
+                .map(|p| p.to_vec())
+                .unwrap_or_else(|| vec![crate::scan::DEFAULT_ADB_PORT]),
+            timeout: timeout.unwrap_or(std::time::Duration::from_millis(800)),
+            concurrency: 96,
+        };
+        get_runtime().block_on(crate::scan::scan_devices(options))
+    }
 }

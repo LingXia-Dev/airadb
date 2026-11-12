@@ -115,6 +115,21 @@ enum Commands {
         /// Output path for private key (default: ~/.android/adbkey)
         out: Option<PathBuf>,
     },
+
+    /// Scan local network for ADB devices
+    Scan {
+        /// Subnet or prefix to scan (e.g. 192.168.1 or 192.168.1.0/24). Auto-detected if omitted.
+        #[arg(short = 'n', long = "subnet")]
+        subnet: Option<String>,
+
+        /// Comma-separated ports to probe (default: 5555)
+        #[arg(short = 'p', long = "ports", value_delimiter = ',', default_value = "5555")]
+        ports: Vec<u16>,
+
+        /// Per-probe timeout in milliseconds (default: 800)
+        #[arg(short = 't', long = "timeout", default_value = "800")]
+        timeout_ms: u64,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -185,6 +200,53 @@ async fn main() {
         return;
     }
 
+    // Handle scan standalone without connecting to a specific server
+    if let Commands::Scan {
+        subnet,
+        ports,
+        timeout_ms,
+    } = cli.command
+    {
+        let port_info = ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("Scanning network for ADB devices (ports: {})...", port_info);
+
+        let options = radb::ScanOptions {
+            subnet,
+            candidates: None,
+            ports,
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            concurrency: 96,
+        };
+
+        match radb::scan_devices(options).await {
+            Ok(devices) => {
+                if devices.is_empty() {
+                    println!("No ADB devices discovered.");
+                } else {
+                    println!("\nDiscovered {} ADB device(s):", devices.len());
+                    for d in devices {
+                        let auth_str = if d.authorized {
+                            "authorized"
+                        } else {
+                            "unauthorized / needs auth"
+                        };
+                        let model_str = d.model.as_deref().unwrap_or("unknown");
+                        println!("  - {:21} [{:16}] ({})", d.addr, model_str, auth_str);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Scan error: {}", e);
+                process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Load key
     let key = match cli.key {
         Some(p) => match AdbKeyPair::from_file(&p) {
@@ -216,7 +278,7 @@ async fn main() {
     };
 
     match cli.command {
-        Commands::Keygen { .. } => unreachable!(),
+        Commands::Keygen { .. } | Commands::Scan { .. } => unreachable!(),
         Commands::Connect => {
             println!("Connected successfully to {}", cli.server);
             println!("Device banner: {}", device.banner().trim());

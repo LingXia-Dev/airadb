@@ -10,6 +10,7 @@ pub mod device;
 pub mod error;
 pub mod packet;
 pub mod pool;
+pub mod scan;
 pub mod stream;
 pub mod sync;
 
@@ -20,5 +21,9 @@ pub use device::{AdbDevice, RebootMode, ShellOutput};
 pub use error::{AdbError, Result};
 pub use packet::{AdbMessageHeader, AdbPacket};
 pub use pool::DevicePool;
+pub use scan::{
+    detect_local_ipv4, parse_subnet_candidates, probe_adb_device, scan_devices,
+    DiscoveredDevice, ScanOptions, DEFAULT_ADB_PORT,
+};
 pub use stream::AdbStream;
 pub use sync::{AdbSync, SyncDent, SyncStat};
