@@ -323,7 +323,7 @@ async fn main() {
         Commands::Ls { remote } => {
             match device.list(&remote).await {
                 Ok(entries) => {
-                    println!("{:<10} {:>10} {:>10} {}", "MODE", "SIZE", "MTIME", "NAME");
+                    println!("{:<10} {:>10} {:>10} NAME", "MODE", "SIZE", "MTIME");
                     println!("{:-<50}", "");
                     for ent in entries {
                         let type_char = if ent.is_dir() { 'd' } else { '-' };

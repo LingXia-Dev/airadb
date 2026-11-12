@@ -132,7 +132,7 @@ impl AdbKeyPair {
         let n0_rem = &n_biguint % mod_32;
         let n0 = n0_rem.to_u32().unwrap_or(0);
 
-        if n0 % 2 == 0 {
+        if n0.is_multiple_of(2) {
             return Err(AdbError::CryptoError("Modulus is even, invalid RSA key".into()));
         }
 
@@ -240,6 +240,7 @@ pub fn load_or_generate_default_key() -> Result<AdbKeyPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::traits::PrivateKeyParts;
 
     #[test]
     fn test_mod_inverse_u32() {
