@@ -2,12 +2,12 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
-use radb::crypto::AdbKeyPair;
-use radb::packet::{
+use airadb::crypto::AdbKeyPair;
+use airadb::packet::{
     read_packet, write_packet, AdbPacket, ADB_AUTH_SIGNATURE, ADB_AUTH_TOKEN, A_AUTH, A_CLSE,
     A_CNXN, A_OKAY, A_OPEN, A_VERSION_MIN, A_WRTE,
 };
-use radb::AdbConnection;
+use airadb::AdbConnection;
 
 #[tokio::test]
 async fn test_mock_adbd_single_connection_multiple_commands() {

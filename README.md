@@ -1,8 +1,8 @@
-# radb
+# airadb
 
 A pure Rust ADB (Android Debug Bridge) client library and CLI tool designed for direct TCP connections to `adbd`.
 
-`radb` is specifically tailored for cross-platform environments (including **iOS**, **Android**, macOS, Linux, and Windows) and legacy Android devices (**Android 5.0 Lollipop and above**).
+`airadb` is specifically tailored for cross-platform environments (including **iOS**, **Android**, macOS, Linux, and Windows) and legacy Android devices (**Android 5.0 Lollipop and above**).
 
 ---
 
@@ -25,11 +25,11 @@ A pure Rust ADB (Android Debug Bridge) client library and CLI tool designed for 
 
 ## Library Usage
 
-Add `radb` to your `Cargo.toml`:
+Add `airadb` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-radb = "0.1.0"
+airadb = "0.1.0"
 tokio = { version = "1.38", features = ["full"] }
 ```
 
@@ -38,7 +38,7 @@ tokio = { version = "1.38", features = ["full"] }
 Notice that all commands reuse the **same TCP connection**:
 
 ```rust
-use radb::AdbDevice;
+use airadb::AdbDevice;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 File transfers use the binary ADB `sync:` protocol over the persistent connection:
 
 ```rust
-use radb::AdbDevice;
+use airadb::AdbDevice;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Ideal for binary outputs such as taking screenshots:
 
 ```rust
-use radb::AdbDevice;
+use airadb::AdbDevice;
 use tokio::fs;
 
 #[tokio::main]
@@ -119,10 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 4. In-Memory Byte Push & Device Connection Pool
 
-For tools that manage multiple devices (like `mukeinstall`), `radb` provides `DevicePool` and `BlockingDevicePool` which maintain persistent connections by `SocketAddr`:
+For tools that manage multiple devices (like `mukeinstall`), `airadb` provides `DevicePool` and `BlockingDevicePool` which maintain persistent connections by `SocketAddr`:
 
 ```rust
-use radb::pool::DevicePool;
+use airadb::pool::DevicePool;
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -144,10 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### 5. Synchronous / Blocking API (for FFI / Non-Async Traits)
 
-If your app uses synchronous traits (e.g. `mukeinstall-lib`'s `AdbBackend`), you can use `radb::blocking::BlockingDevicePool`:
+If your app uses synchronous traits (e.g. `mukeinstall-lib`'s `AdbBackend`), you can use `airadb::blocking::BlockingDevicePool`:
 
 ```rust
-use radb::blocking::BlockingDevicePool;
+use airadb::blocking::BlockingDevicePool;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -167,7 +167,7 @@ fn run_sync(addr: SocketAddr, key_path: &Path) {
 Discover ADB devices on your local network without relying on ICMP ping (which is frequently blocked by TV boxes and router isolation):
 
 ```rust
-use radb::scan::{scan_devices, ScanOptions};
+use airadb::scan::{scan_devices, ScanOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## CLI Tool
 
-`radb` comes with a command-line binary.
+`airadb` comes with a command-line binary.
 
 ### Installation
 
@@ -203,45 +203,45 @@ cargo install --path .
 
 ```bash
 # Scan local network for ADB devices (auto-detects subnet, probes port 5555)
-radb scan
+airadb scan
 
 # Scan custom subnet and specific ports
-radb scan --subnet 192.168.1.0/24 --ports 5555,55555
+airadb scan --subnet 192.168.1.0/24 --ports 5555,55555
 
 # Test connection and show device info
-radb -s 192.168.1.100:5555 connect
+airadb -s 192.168.1.100:5555 connect
 
 # Run a shell command
-radb -s 192.168.1.100:5555 shell getprop ro.product.model
+airadb -s 192.168.1.100:5555 shell getprop ro.product.model
 
 # Start an interactive shell session
-radb -s 192.168.1.100:5555 shell
+airadb -s 192.168.1.100:5555 shell
 
 # Run exec command (raw binary stdout)
-radb -s 192.168.1.100:5555 exec screencap -p > screenshot.png
+airadb -s 192.168.1.100:5555 exec screencap -p > screenshot.png
 
 # Push and Pull files
-radb -s 192.168.1.100:5555 push local_video.mp4 /sdcard/Movies/
-radb -s 192.168.1.100:5555 pull /sdcard/Movies/local_video.mp4
+airadb -s 192.168.1.100:5555 push local_video.mp4 /sdcard/Movies/
+airadb -s 192.168.1.100:5555 pull /sdcard/Movies/local_video.mp4
 
 # Check file stat and list directory
-radb -s 192.168.1.100:5555 stat /sdcard/Movies
-radb -s 192.168.1.100:5555 ls /sdcard/Movies
+airadb -s 192.168.1.100:5555 stat /sdcard/Movies
+airadb -s 192.168.1.100:5555 ls /sdcard/Movies
 
 # Install an APK
-radb -s 192.168.1.100:5555 install app-debug.apk
+airadb -s 192.168.1.100:5555 install app-debug.apk
 
 # Reboot device
-radb -s 192.168.1.100:5555 reboot recovery
+airadb -s 192.168.1.100:5555 reboot recovery
 
 # Remount filesystem as RW
-radb -s 192.168.1.100:5555 remount
+airadb -s 192.168.1.100:5555 remount
 
 # Switch adbd TCP port
-radb -s 192.168.1.100:5555 tcpip 5555
+airadb -s 192.168.1.100:5555 tcpip 5555
 
 # Generate an ADB RSA keypair
-radb keygen ~/.android/adbkey
+airadb keygen ~/.android/adbkey
 ```
 
 ---

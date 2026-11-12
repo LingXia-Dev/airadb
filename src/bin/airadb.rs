@@ -4,12 +4,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{self, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
-use radb::crypto::{default_key_path, load_or_generate_default_key, AdbKeyPair};
-use radb::device::RebootMode;
-use radb::AdbDevice;
+use airadb::crypto::{default_key_path, load_or_generate_default_key, AdbKeyPair};
+use airadb::device::RebootMode;
+use airadb::AdbDevice;
 
 #[derive(Parser)]
-#[command(name = "radb", author, version, about = "Pure Rust ADB client for TCP connections (Android 5+)", long_about = None)]
+#[command(name = "airadb", author, version, about = "Pure Rust ADB client for TCP connections (Android 5+)", long_about = None)]
 struct Cli {
     /// Target device TCP address (ip:port)
     #[arg(short = 's', long = "server", default_value = "127.0.0.1:5555")]
@@ -156,9 +156,9 @@ async fn main() {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
-        EnvFilter::new("debug,radb=trace")
+        EnvFilter::new("debug,airadb=trace")
     } else {
-        EnvFilter::new("warn,radb=info")
+        EnvFilter::new("warn,airadb=info")
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -178,7 +178,7 @@ async fn main() {
                     process::exit(1);
                 }
                 let pub_path = key_path.with_extension("pub");
-                match key.android_pubkey_string("radb@client") {
+                match key.android_pubkey_string("airadb@client") {
                     Ok(pub_str) => {
                         let _ = std::fs::write(
                             &pub_path,
@@ -214,7 +214,7 @@ async fn main() {
             .join(",");
         println!("Scanning network for ADB devices (ports: {})...", port_info);
 
-        let options = radb::ScanOptions {
+        let options = airadb::ScanOptions {
             subnet,
             candidates: None,
             ports,
@@ -222,7 +222,7 @@ async fn main() {
             concurrency: 96,
         };
 
-        match radb::scan_devices(options).await {
+        match airadb::scan_devices(options).await {
             Ok(devices) => {
                 if devices.is_empty() {
                     println!("No ADB devices discovered.");

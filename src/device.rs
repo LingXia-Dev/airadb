@@ -374,7 +374,7 @@ impl AdbDevice {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let remote_tmp_apk = format!("/data/local/tmp/radb_pkg_{}.apk", now);
+        let remote_tmp_apk = format!("/data/local/tmp/airadb_pkg_{}.apk", now);
 
         self.push_file(local_apk_path, &remote_tmp_apk).await?;
 

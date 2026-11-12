@@ -107,7 +107,7 @@ impl AdbConnection {
             if response.command == A_AUTH && response.arg0 == ADB_AUTH_TOKEN {
                 // Device does not recognize the key, send public key
                 debug!("Signature rejected; sending public key for authorization");
-                let pubkey_str = auth_key.android_pubkey_string("radb@client")?;
+                let pubkey_str = auth_key.android_pubkey_string("airadb@client")?;
                 let pubkey_packet = AdbPacket::new(
                     A_AUTH,
                     ADB_AUTH_RSAPUBLICKEY,

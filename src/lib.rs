@@ -1,7 +1,7 @@
-//! radb - Pure Rust ADB (Android Debug Bridge) client library.
+//! airadb - Pure Rust ADB (Android Debug Bridge) client library.
 //!
 //! Provides a TCP-only client supporting Android 5+ with persistent
-//! multiplexed connections.
+//! multiplexed connections, device discovery, and mobile cross-platform embedding.
 
 pub mod blocking;
 pub mod connection;

@@ -3,12 +3,12 @@ use byteorder::{ByteOrder, LittleEndian};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
 
-use radb::crypto::AdbKeyPair;
-use radb::packet::{
+use airadb::crypto::AdbKeyPair;
+use airadb::packet::{
     read_packet, write_packet, AdbPacket, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION_MIN, A_WRTE,
 };
-use radb::sync::{ID_DATA, ID_DENT, ID_DONE, ID_LIST, ID_OKAY, ID_RECV, ID_SEND, ID_STAT};
-use radb::{AdbDevice, RebootMode};
+use airadb::sync::{ID_DATA, ID_DENT, ID_DONE, ID_LIST, ID_OKAY, ID_RECV, ID_SEND, ID_STAT};
+use airadb::{AdbDevice, RebootMode};
 
 #[tokio::test]
 async fn test_device_high_level_api_and_sync() {
@@ -229,7 +229,7 @@ fn tempfile_dir() -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("radb_test_{}", now));
+    let dir = std::env::temp_dir().join(format!("airadb_test_{}", now));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

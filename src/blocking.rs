@@ -16,9 +16,9 @@ fn get_runtime() -> &'static Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
-            .thread_name("radb-runtime")
+            .thread_name("airadb-runtime")
             .build()
-            .expect("Failed to initialize radb background tokio runtime")
+            .expect("Failed to initialize airadb background tokio runtime")
     })
 }
 

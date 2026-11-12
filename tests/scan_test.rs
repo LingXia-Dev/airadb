@@ -2,9 +2,9 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-use radb::packet::{read_packet, write_packet, AdbPacket, ADB_AUTH_TOKEN, A_AUTH, A_CNXN};
-use radb::scan::{probe_adb_device, scan_devices, ScanOptions};
-use radb::BlockingDevicePool;
+use airadb::packet::{read_packet, write_packet, AdbPacket, ADB_AUTH_TOKEN, A_AUTH, A_CNXN};
+use airadb::scan::{probe_adb_device, scan_devices, ScanOptions};
+use airadb::BlockingDevicePool;
 
 #[tokio::test]
 async fn test_scan_and_probe_devices() {

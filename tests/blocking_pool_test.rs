@@ -1,11 +1,11 @@
 use byteorder::{ByteOrder, LittleEndian};
 use tokio::net::TcpListener;
 
-use radb::blocking::BlockingDevicePool;
-use radb::packet::{
+use airadb::blocking::BlockingDevicePool;
+use airadb::packet::{
     read_packet, write_packet, AdbPacket, A_CLSE, A_CNXN, A_OKAY, A_OPEN, A_VERSION_MIN, A_WRTE,
 };
-use radb::sync::{ID_DONE, ID_OKAY};
+use airadb::sync::{ID_DONE, ID_OKAY};
 
 #[test]
 fn test_blocking_device_pool_mukeinstall_compat() {
@@ -94,7 +94,7 @@ fn test_blocking_device_pool_mukeinstall_compat() {
     let addr = addr_rx.recv().unwrap();
 
     let pool = BlockingDevicePool::new();
-    let temp_key_dir = std::env::temp_dir().join("test_radb_key_home");
+    let temp_key_dir = std::env::temp_dir().join("test_airadb_key_home");
     let _ = std::fs::create_dir_all(&temp_key_dir);
 
     // 1. Sync shell call

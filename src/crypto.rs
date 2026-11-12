@@ -227,7 +227,7 @@ pub fn load_or_generate_default_key() -> Result<AdbKeyPair> {
         let key = AdbKeyPair::generate()?;
         let _ = key.save_to_file(&path);
         // Also save .pub
-        if let Ok(pub_str) = key.android_pubkey_string("radb@client") {
+        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
             let pub_path = path.with_extension("pub");
             let _ = fs::write(pub_path, pub_str.trim_end_matches('\0'));
         }
@@ -257,7 +257,7 @@ pub fn load_or_create_from_path<P: AsRef<Path>>(path: P) -> Result<AdbKeyPair> {
         let key_path = p.join("adbkey");
         let key = AdbKeyPair::generate()?;
         let _ = key.save_to_file(&key_path);
-        if let Ok(pub_str) = key.android_pubkey_string("radb@client") {
+        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
             let _ = fs::write(key_path.with_extension("pub"), pub_str.trim_end_matches('\0'));
         }
         Ok(key)
@@ -267,7 +267,7 @@ pub fn load_or_create_from_path<P: AsRef<Path>>(path: P) -> Result<AdbKeyPair> {
         // File doesn't exist yet, generate and save
         let key = AdbKeyPair::generate()?;
         let _ = key.save_to_file(p);
-        if let Ok(pub_str) = key.android_pubkey_string("radb@client") {
+        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
             let _ = fs::write(p.with_extension("pub"), pub_str.trim_end_matches('\0'));
         }
         Ok(key)
