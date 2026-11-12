@@ -1,0 +1,35 @@
+[package]
+name = "radb"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust ADB client supporting TCP transport and Android 5+"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/radb/radb"
+readme = "README.md"
+keywords = ["adb", "android", "client", "tcp", "pure-rust"]
+categories = ["network-programming", "command-line-utilities", "development-tools"]
+
+[dependencies]
+tokio = { version = "1.38", features = ["io-util", "net", "sync", "macros", "rt", "rt-multi-thread", "time"] }
+rsa = { version = "0.9", features = ["pem", "sha1"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+sha1 = "0.10"
+base64 = "0.22"
+byteorder = "1.5"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["full", "test-util"] }
+
+[[bin]]
+name = "radb"
+path = "src/bin/radb.rs"
+
+[lib]
+name = "radb"
+path = "src/lib.rs"
