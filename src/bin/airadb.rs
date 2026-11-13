@@ -141,9 +141,13 @@ enum Commands {
         #[arg(short = 'n', long = "subnet")]
         subnet: Option<String>,
 
-        /// Comma-separated ports to probe (default: 5555)
-        #[arg(short = 'p', long = "ports", value_delimiter = ',', default_value = "5555")]
+        /// Comma-separated ports to probe (default: 5555,9527)
+        #[arg(short = 'p', long = "ports", value_delimiter = ',', default_value = "5555,9527")]
         ports: Vec<u16>,
+
+        /// Disable mDNS multicast discovery
+        #[arg(long = "no-mdns")]
+        no_mdns: bool,
 
         /// Per-probe timeout in milliseconds (default: 800)
         #[arg(short = 't', long = "timeout", default_value = "800")]
@@ -223,6 +227,7 @@ async fn main() {
     if let Commands::Scan {
         subnet,
         ports,
+        no_mdns,
         timeout_ms,
     } = cli.command
     {
@@ -231,7 +236,8 @@ async fn main() {
             .map(|p| p.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        println!("Scanning network for ADB devices (ports: {})...", port_info);
+        let mdns_str = if !no_mdns { " + mDNS" } else { "" };
+        println!("Scanning network for ADB devices (ports: {}{})...", port_info, mdns_str);
 
         let options = airadb::ScanOptions {
             subnet,
@@ -239,6 +245,7 @@ async fn main() {
             ports,
             timeout: std::time::Duration::from_millis(timeout_ms),
             concurrency: 96,
+            mdns: !no_mdns,
         };
 
         match airadb::scan_devices(options).await {

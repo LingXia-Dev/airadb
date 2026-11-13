@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,8 +9,12 @@ use tokio::time::timeout;
 use crate::error::Result;
 use crate::packet::{read_packet, write_packet, AdbPacket, A_AUTH, A_CNXN, A_VERSION_SKIP_CHECKSUM};
 
-/// Default TCP port for ADB daemon.
+/// Default TCP port for standard ADB daemon.
 pub const DEFAULT_ADB_PORT: u16 = 5555;
+
+/// Default list of TCP ports probed during network scan.
+/// 5555 is standard Android adbd; 9527 is commonly used on Smart TV / OTT boxes (e.g. Hisilicon).
+pub const DEFAULT_ADB_PORTS: &[u16] = &[5555, 9527];
 
 /// Information about a discovered ADB device on the local network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +41,14 @@ pub struct ScanOptions {
     pub subnet: Option<String>,
     /// Explicit list of candidate IP addresses to probe. Overrides `subnet` if provided.
     pub candidates: Option<Vec<Ipv4Addr>>,
-    /// Ports to probe on each candidate IP. Defaults to `[5555]`.
+    /// Ports to probe on each candidate IP. Defaults to `[5555, 9527]`.
     pub ports: Vec<u16>,
     /// Timeout for each connection and probe attempt. Defaults to 800ms.
     pub timeout: Duration,
     /// Maximum concurrent TCP probes to run simultaneously. Defaults to 96.
     pub concurrency: usize,
+    /// Whether to perform mDNS multicast discovery (`_adb._tcp.local`). Defaults to true.
+    pub mdns: bool,
 }
 
 impl Default for ScanOptions {
@@ -49,9 +56,10 @@ impl Default for ScanOptions {
         Self {
             subnet: None,
             candidates: None,
-            ports: vec![DEFAULT_ADB_PORT],
+            ports: DEFAULT_ADB_PORTS.to_vec(),
             timeout: Duration::from_millis(800),
             concurrency: 96,
+            mdns: true,
         }
     }
 }
@@ -199,11 +207,203 @@ pub async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option
     }
 }
 
+/// Builds a DNS PTR query packet for an mDNS service name (e.g. `_adb._tcp.local`).
+fn build_mdns_ptr_query(service_name: &str) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(64);
+    packet.extend_from_slice(&[0x00, 0x00]); // ID 0
+    packet.extend_from_slice(&[0x00, 0x00]); // Standard query
+    packet.extend_from_slice(&[0x00, 0x01]); // 1 Question
+    packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // Answers/Auth/Add = 0
+
+    for label in service_name.split('.') {
+        if !label.is_empty() {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+    }
+    packet.push(0x00); // Root label
+
+    packet.extend_from_slice(&[0x00, 0x0c]); // Type: PTR (12)
+    packet.extend_from_slice(&[0x00, 0x01]); // Class: IN (1)
+    packet
+}
+
+/// Helper to advance past a DNS name label sequence (supporting DNS compression pointers).
+fn skip_dns_name(buf: &[u8], mut idx: usize) -> Option<usize> {
+    let mut jumped = false;
+    let mut ret_idx = idx;
+    let mut count = 0;
+    while idx < buf.len() && count < 64 {
+        count += 1;
+        let len = buf[idx];
+        if len == 0 {
+            if !jumped {
+                ret_idx = idx + 1;
+            }
+            return Some(ret_idx);
+        } else if (len & 0xc0) == 0xc0 {
+            if idx + 2 > buf.len() {
+                return None;
+            }
+            if !jumped {
+                ret_idx = idx + 2;
+            }
+            jumped = true;
+            let ptr = (((len as u16 & 0x3f) << 8) | buf[idx + 1] as u16) as usize;
+            idx = ptr;
+        } else {
+            let label_len = len as usize;
+            idx += 1 + label_len;
+            if !jumped {
+                ret_idx = idx;
+            }
+        }
+    }
+    None
+}
+
+/// Parses an mDNS response packet, extracting SRV ports and A record IPv4 addresses.
+pub fn parse_mdns_response(buf: &[u8], peer_ip: Ipv4Addr) -> Vec<SocketAddr> {
+    if buf.len() < 12 {
+        return Vec::new();
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let nscount = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+    let arcount = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+
+    let mut idx = 12;
+    for _ in 0..qdcount {
+        idx = match skip_dns_name(buf, idx) {
+            Some(i) => i,
+            None => return Vec::new(),
+        };
+        if idx + 4 > buf.len() {
+            return Vec::new();
+        }
+        idx += 4;
+    }
+
+    let total_rrs = ancount + nscount + arcount;
+    let mut srv_ports = Vec::new();
+    let mut a_ips = Vec::new();
+
+    for _ in 0..total_rrs {
+        if idx >= buf.len() {
+            break;
+        }
+        idx = match skip_dns_name(buf, idx) {
+            Some(i) => i,
+            None => break,
+        };
+        if idx + 10 > buf.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([buf[idx], buf[idx + 1]]);
+        let rdlen = u16::from_be_bytes([buf[idx + 8], buf[idx + 9]]) as usize;
+        idx += 10;
+        if idx + rdlen > buf.len() {
+            break;
+        }
+        let rdata = &buf[idx..idx + rdlen];
+        idx += rdlen;
+
+        if rtype == 33 && rdlen >= 6 {
+            // SRV record: priority(2), weight(2), port(2)
+            let port = u16::from_be_bytes([rdata[4], rdata[5]]);
+            if port > 0 && !srv_ports.contains(&port) {
+                srv_ports.push(port);
+            }
+        } else if rtype == 1 && rdlen == 4 {
+            // A record
+            let ip = Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]);
+            if !a_ips.contains(&ip) {
+                a_ips.push(ip);
+            }
+        }
+    }
+
+    let ips = if !a_ips.is_empty() {
+        a_ips
+    } else {
+        vec![peer_ip]
+    };
+
+    let mut endpoints = Vec::new();
+    for ip in ips {
+        for &port in &srv_ports {
+            endpoints.push(SocketAddr::new(IpAddr::V4(ip), port));
+        }
+    }
+    endpoints
+}
+
+/// Discovers ADB device endpoints on the local network via mDNS multicast (`224.0.0.251:5353`).
+pub async fn discover_mdns_adb_endpoints(timeout_dur: Duration) -> Vec<SocketAddr> {
+    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let multicast_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
+    let query_plain = build_mdns_ptr_query("_adb._tcp.local");
+    let query_tls = build_mdns_ptr_query("_adb-tls-connect._tcp.local");
+
+    let _ = socket.send_to(&query_plain, multicast_addr).await;
+    let _ = socket.send_to(&query_tls, multicast_addr).await;
+
+    let mut discovered = HashSet::new();
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+    let mut buf = [0u8; 4096];
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, peer_addr))) => {
+                if let IpAddr::V4(ipv4) = peer_addr.ip() {
+                    let endpoints = parse_mdns_response(&buf[..len], ipv4);
+                    for ep in endpoints {
+                        discovered.insert(ep);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    discovered.into_iter().collect()
+}
+
 /// Scans the network for active ADB devices according to `options`.
 ///
-/// Runs concurrent TCP probes bounded by `options.concurrency` and returns all
-/// responsive ADB devices.
+/// Combines mDNS multicast discovery with concurrent TCP probing bounded by `options.concurrency`
+/// and returns all responsive ADB devices.
 pub async fn scan_devices(options: ScanOptions) -> Result<Vec<DiscoveredDevice>> {
+    let mut candidate_addrs = HashSet::new();
+
+    // 1. Run mDNS discovery if enabled and candidates is not explicitly constrained
+    if options.mdns && options.candidates.is_none() {
+        let mdns_endpoints = discover_mdns_adb_endpoints(Duration::from_millis(500)).await;
+        for ep in mdns_endpoints {
+            // If subnet is specified, only include endpoints matching that subnet
+            if let Some(ref subnet_str) = options.subnet {
+                if let Some(valid_ips) = parse_subnet_candidates(subnet_str) {
+                    if let IpAddr::V4(ipv4) = ep.ip() {
+                        if !valid_ips.contains(&ipv4) {
+                            continue;
+                        }
+                    }
+                }
+            }
+            candidate_addrs.insert(ep);
+        }
+    }
+
+    // 2. Add candidates from subnet / IP candidate list
     let candidate_ips = if let Some(candidates) = options.candidates {
         candidates
     } else if let Some(ref subnet_str) = options.subnet {
@@ -217,33 +417,36 @@ pub async fn scan_devices(options: ScanOptions) -> Result<Vec<DiscoveredDevice>>
         Vec::new()
     };
 
-    if candidate_ips.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let ports = if options.ports.is_empty() {
-        vec![DEFAULT_ADB_PORT]
+        DEFAULT_ADB_PORTS.to_vec()
     } else {
         options.ports
     };
 
-    let semaphore = Arc::new(Semaphore::new(options.concurrency));
-    let mut tasks = Vec::with_capacity(candidate_ips.len() * ports.len());
-
     for ip in candidate_ips {
         for &port in &ports {
-            let addr = SocketAddr::new(IpAddr::V4(ip), port);
-            let sem = semaphore.clone();
-            let timeout_dur = options.timeout;
-
-            tasks.push(tokio::spawn(async move {
-                let _permit = match sem.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => return None,
-                };
-                probe_adb_device(addr, timeout_dur).await
-            }));
+            candidate_addrs.insert(SocketAddr::new(IpAddr::V4(ip), port));
         }
+    }
+
+    if candidate_addrs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let semaphore = Arc::new(Semaphore::new(options.concurrency));
+    let mut tasks = Vec::with_capacity(candidate_addrs.len());
+
+    for addr in candidate_addrs {
+        let sem = semaphore.clone();
+        let timeout_dur = options.timeout;
+
+        tasks.push(tokio::spawn(async move {
+            let _permit = match sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            probe_adb_device(addr, timeout_dur).await
+        }));
     }
 
     let mut discovered = Vec::new();
@@ -253,7 +456,7 @@ pub async fn scan_devices(options: ScanOptions) -> Result<Vec<DiscoveredDevice>>
         }
     }
 
-    // Sort by IP address for clean output
+    // Sort by IP address and port for deterministic output
     discovered.sort_by_key(|d| d.addr);
     Ok(discovered)
 }

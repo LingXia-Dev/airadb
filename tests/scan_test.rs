@@ -42,6 +42,7 @@ async fn test_scan_and_probe_devices() {
         ports: vec![port, 9999], // 9999 is closed
         timeout: Duration::from_millis(500),
         concurrency: 10,
+        mdns: false,
     };
 
     let discovered = scan_devices(options).await.unwrap();

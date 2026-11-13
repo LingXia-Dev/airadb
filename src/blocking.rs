@@ -245,9 +245,10 @@ impl BlockingDevicePool {
             candidates: None,
             ports: ports
                 .map(|p| p.to_vec())
-                .unwrap_or_else(|| vec![crate::scan::DEFAULT_ADB_PORT]),
+                .unwrap_or_else(|| crate::scan::DEFAULT_ADB_PORTS.to_vec()),
             timeout: timeout.unwrap_or(std::time::Duration::from_millis(800)),
             concurrency: 96,
+            mdns: true,
         };
         get_runtime().block_on(crate::scan::scan_devices(options))
     }
