@@ -185,7 +185,7 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
             }
         })?;
 
-        if !skip_checksum {
+        if !skip_checksum && header.data_check != 0 {
             let calculated = calculate_checksum(&payload);
             if calculated != header.data_check {
                 return Err(AdbError::ChecksumMismatch {

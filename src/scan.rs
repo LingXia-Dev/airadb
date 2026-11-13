@@ -61,19 +61,22 @@ impl Default for ScanOptions {
 /// This does NOT send any packets on the wire, making it completely non-intrusive
 /// and compatible with iOS, Android, HarmonyOS, macOS, and Linux sandboxes.
 pub fn detect_local_ipv4() -> Option<Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    // Connect to a public IP to determine default route interface (no packet sent)
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ipv4) => {
-            if ipv4.is_loopback() || ipv4.is_unspecified() {
-                None
-            } else {
-                Some(ipv4)
+    // 1. First probe multicast (224.0.0.1:80), which routes to the physical Wi-Fi/LAN interface
+    //    and correctly bypasses point-to-point VPN/TUN tunnels (which don't handle multicast).
+    for probe in &["224.0.0.1:80", "239.255.255.250:80", "8.8.8.8:80"] {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(probe).is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    if let IpAddr::V4(ipv4) = addr.ip() {
+                        if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                            return Some(ipv4);
+                        }
+                    }
+                }
             }
         }
-        _ => None,
     }
+    None
 }
 
 /// Parses an IP prefix string (e.g. "192.168.1", "192.168.1.0/24", "192.168.1.5")
