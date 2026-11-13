@@ -90,7 +90,8 @@ pub async fn query_device_hardware_info(device: &AdbDevice) -> Result<DeviceHard
     // Split compound output by our unique section markers
     let parts: Vec<&str> = raw.split("===AIRADB_").collect();
     for part in parts {
-        if let Some((header, body)) = part.split_once("===\n") {
+        if let Some((header, body)) = part.split_once("===") {
+            let body = body.trim_start_matches(|c| c == '\r' || c == '\n');
             match header {
                 "DF" => df_section = body,
                 "AID" => aid_section = body,
@@ -213,6 +214,38 @@ fn parse_meminfo(content: &str) -> (u64, u64) {
     (total_kb * 1024, avail_kb * 1024)
 }
 
+fn parse_size_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let last = s.chars().last()?;
+    match last {
+        'G' | 'g' => {
+            let num: f64 = s[..s.len() - 1].parse().ok()?;
+            Some((num * 1024.0 * 1024.0 * 1024.0) as u64)
+        }
+        'M' | 'm' => {
+            let num: f64 = s[..s.len() - 1].parse().ok()?;
+            Some((num * 1024.0 * 1024.0) as u64)
+        }
+        'K' | 'k' => {
+            let num: f64 = s[..s.len() - 1].parse().ok()?;
+            Some((num * 1024.0) as u64)
+        }
+        'B' | 'b' => {
+            let num: u64 = s[..s.len() - 1].parse().ok()?;
+            Some(num)
+        }
+        '0'..='9' => {
+            // Raw 1K blocks in standard POSIX df output
+            let blocks: u64 = s.parse().ok()?;
+            Some(blocks * 1024)
+        }
+        _ => None,
+    }
+}
+
 fn parse_df(content: &str) -> (u64, u64) {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -220,7 +253,7 @@ fn parse_df(content: &str) -> (u64, u64) {
             continue;
         }
 
-        // Format 1 (Android 5 toolbox format):
+        // Format 1 (Android 5 toolbox format with labels):
         // "/data: 28282880K total, 7282880K used, 21000000K free"
         if trimmed.contains("total") && trimmed.contains("free") {
             let mut total_bytes = 0u64;
@@ -252,14 +285,15 @@ fn parse_df(content: &str) -> (u64, u64) {
             }
         }
 
-        // Format 2 (Standard toybox/POSIX format):
+        // Format 2:
+        // Table format, e.g.:
         // "/dev/block/dm-0  28282880 7282880 21000000  26% /data"
+        // or Android 5 toolbox humanized:
+        // "/data               1.5G     93.4M    1.4G   4096"
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() >= 4 {
-            if let (Ok(total_1k), Ok(avail_1k)) =
-                (parts[1].parse::<u64>(), parts[3].parse::<u64>())
-            {
-                return (total_1k * 1024, avail_1k * 1024);
+            if let (Some(total), Some(avail)) = (parse_size_bytes(parts[1]), parse_size_bytes(parts[3])) {
+                return (total, avail);
             }
         }
     }
