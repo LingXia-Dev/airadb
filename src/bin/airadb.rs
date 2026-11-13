@@ -32,8 +32,17 @@ enum Commands {
     /// Test connection and authenticate with device
     Connect,
 
-    /// Query comprehensive device hardware info (CPU, RAM, storage, Android version, GPU)
+    /// Query comprehensive device hardware info (CPU, RAM, storage, Android version, Android ID)
     Info,
+
+    /// Get the 64-bit unique Android ID
+    GetId,
+
+    /// Query a system property via getprop
+    Getprop {
+        /// Property key name (e.g. ro.product.model). If omitted, prints all properties.
+        key: Option<String>,
+    },
 
     /// Run a shell command or start an interactive shell
     Shell {
@@ -295,6 +304,9 @@ async fn main() {
             if let Ok(model) = device.get_model().await {
                 println!("Model:         {}", model);
             }
+            if let Ok(Some(aid)) = device.get_android_id().await {
+                println!("Android ID:    {}", aid);
+            }
             if let Ok(version) = device.get_android_version().await {
                 println!("Android OS:    {}", version);
             }
@@ -308,6 +320,32 @@ async fn main() {
                 Ok(info) => println!("{}", info),
                 Err(e) => {
                     eprintln!("Failed to get device hardware info: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::GetId => {
+            match device.get_android_id().await {
+                Ok(Some(id)) => println!("{}", id),
+                Ok(None) => {
+                    eprintln!("Android ID not available on device");
+                    process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Failed to get Android ID: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Getprop { key } => {
+            let cmd = match key {
+                Some(k) => format!("getprop {}", k),
+                None => "getprop".to_string(),
+            };
+            match device.shell(&cmd).await {
+                Ok(out) => print!("{}", out),
+                Err(e) => {
+                    eprintln!("Failed to getprop: {}", e);
                     process::exit(1);
                 }
             }
