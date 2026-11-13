@@ -13,8 +13,9 @@ use crate::packet::{read_packet, write_packet, AdbPacket, A_AUTH, A_CNXN, A_VERS
 pub const DEFAULT_ADB_PORT: u16 = 5555;
 
 /// Default list of TCP ports probed during network scan.
-/// 5555 is standard Android adbd; 9527 is commonly used on Smart TV / OTT boxes (e.g. Hisilicon).
-pub const DEFAULT_ADB_PORTS: &[u16] = &[5555, 9527];
+/// 5555 is standard Android adbd; 9527 is commonly used on Smart TV / OTT boxes (e.g. Hisilicon);
+/// 5566 is commonly used for secondary debug ports / emulator / cloud devices (aligned with mukeinstall).
+pub const DEFAULT_ADB_PORTS: &[u16] = &[5555, 9527, 5566];
 
 /// Information about a discovered ADB device on the local network.
 #[derive(Debug, Clone, PartialEq, Eq)]

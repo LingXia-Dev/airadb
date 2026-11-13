@@ -141,8 +141,8 @@ enum Commands {
         #[arg(short = 'n', long = "subnet")]
         subnet: Option<String>,
 
-        /// Comma-separated ports to probe (default: 5555,9527)
-        #[arg(short = 'p', long = "ports", value_delimiter = ',', default_value = "5555,9527")]
+        /// Comma-separated ports to probe (default: 5555,9527,5566)
+        #[arg(short = 'p', long = "ports", value_delimiter = ',', default_value = "5555,9527,5566")]
         ports: Vec<u16>,
 
         /// Disable mDNS multicast discovery
