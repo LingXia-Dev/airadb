@@ -75,6 +75,14 @@ pub struct AdbDevice {
     connection: Arc<AdbConnection>,
 }
 
+/// Information about an installed application package on Android.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPackage {
+    pub package_name: String,
+    pub apk_path: Option<String>,
+    pub is_system: bool,
+}
+
 impl AdbDevice {
     /// Connects to an ADB device at `addr` using default or auto-generated keys.
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
@@ -536,9 +544,63 @@ impl AdbDevice {
         }
     }
 
+    /// Lists installed application packages on the device.
+    ///
+    /// - `filter`: optional keyword to filter package names
+    /// - `third_party_only`: if true, lists only user-installed apps (`-3`)
+    pub async fn list_packages(
+        &self,
+        filter: Option<&str>,
+        third_party_only: bool,
+    ) -> Result<Vec<InstalledPackage>> {
+        let flag = if third_party_only { "-3 -f" } else { "-f" };
+        let cmd = format!("pm list packages {}", flag);
+        let raw_output = self.shell(&cmd).await?;
+
+        let mut list = Vec::new();
+        let kw_lower = filter.map(|k| k.trim().to_lowercase());
+
+        for line in raw_output.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("package:") {
+                let (apk_path, pkg_name) = if let Some((path, pkg)) = rest.rsplit_once('=') {
+                    (Some(path.to_string()), pkg.to_string())
+                } else {
+                    (None, rest.to_string())
+                };
+
+                if let Some(ref kw) = kw_lower {
+                    if !pkg_name.to_lowercase().contains(kw) {
+                        continue;
+                    }
+                }
+
+                let is_system = apk_path
+                    .as_deref()
+                    .map(|p| !p.starts_with("/data/"))
+                    .unwrap_or(!third_party_only);
+
+                list.push(InstalledPackage {
+                    package_name: pkg_name,
+                    apk_path,
+                    is_system,
+                });
+            }
+        }
+
+        list.sort_by(|a, b| a.package_name.cmp(&b.package_name));
+        Ok(list)
+    }
+
     /// Uninstalls an application package from the device.
     pub async fn uninstall(&self, package_name: &str) -> Result<()> {
-        let cmd = format!("pm uninstall \"{}\"", package_name);
+        self.uninstall_package(package_name, false).await
+    }
+
+    /// Uninstalls an application package, optionally preserving app data and cache.
+    pub async fn uninstall_package(&self, package_name: &str, keep_data: bool) -> Result<()> {
+        let flag = if keep_data { "-k " } else { "" };
+        let cmd = format!("pm uninstall {}\"{}\"", flag, package_name);
         let output = self.shell(&cmd).await?;
         if output.contains("Success") {
             Ok(())
@@ -548,5 +610,75 @@ impl AdbDevice {
                 output.trim()
             )))
         }
+    }
+
+    /// Launches / starts an application package on the device.
+    ///
+    /// If `activity` is specified, launches via `am start -n <package>/<activity>`.
+    /// If `activity` is None, launches via `monkey -p <package> -c android.intent.category.LAUNCHER 1`.
+    pub async fn start_app(&self, package_name: &str, activity: Option<&str>) -> Result<()> {
+        if let Some(act) = activity {
+            let full_act = if act.starts_with('.') {
+                format!("{}{}", package_name, act)
+            } else {
+                act.to_string()
+            };
+            let cmd = format!("am start -n \"{}/{}\"", package_name, full_act);
+            let output = self.shell(&cmd).await?;
+            if output.contains("Error:") {
+                return Err(AdbError::CommandFailed(format!("am start failed: {}", output.trim())));
+            }
+            Ok(())
+        } else {
+            let cmd = format!("monkey -p \"{}\" -c android.intent.category.LAUNCHER 1", package_name);
+            let output = self.shell(&cmd).await?;
+            if output.contains("No activities found to run") || output.contains("** No activities found") {
+                let fallback = format!("am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p \"{}\"", package_name);
+                let fallback_out = self.shell(&fallback).await?;
+                if fallback_out.contains("Error:") {
+                    return Err(AdbError::CommandFailed(format!(
+                        "Could not launch package '{}': neither monkey nor am start found a launcher activity",
+                        package_name
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Force stops / closes an application on the device (`am force-stop`).
+    pub async fn stop_app(&self, package_name: &str) -> Result<()> {
+        let cmd = format!("am force-stop \"{}\"", package_name);
+        self.shell(&cmd).await?;
+        Ok(())
+    }
+
+    /// Clears application cache and local data (`pm clear`).
+    pub async fn clear_app_data(&self, package_name: &str) -> Result<()> {
+        let cmd = format!("pm clear \"{}\"", package_name);
+        let output = self.shell(&cmd).await?;
+        if output.contains("Success") {
+            Ok(())
+        } else {
+            Err(AdbError::CommandFailed(format!("pm clear failed: {}", output.trim())))
+        }
+    }
+
+    /// Gets the currently focused foreground application (package and activity) on the device.
+    pub async fn current_app(&self) -> Result<Option<String>> {
+        let output = self.shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'").await?;
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some(pos) = line.find(" u0 ") {
+                let rest = &line[pos + 4..];
+                if let Some(end) = rest.find('}') {
+                    let target = rest[..end].trim();
+                    if !target.is_empty() && target != "null" {
+                        return Ok(Some(target.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 }

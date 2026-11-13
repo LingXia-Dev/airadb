@@ -18,7 +18,7 @@ pub mod sync;
 pub use blocking::BlockingDevicePool;
 pub use connection::AdbConnection;
 pub use crypto::{load_or_create_from_path, load_or_generate_default_key, AdbKeyPair};
-pub use device::{AdbDevice, RebootMode, ShellOutput};
+pub use device::{AdbDevice, InstalledPackage, RebootMode, ShellOutput};
 pub use error::{AdbError, Result};
 pub use info::{query_device_hardware_info, DeviceHardwareInfo};
 pub use packet::{AdbMessageHeader, AdbPacket};

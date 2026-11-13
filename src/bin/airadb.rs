@@ -104,6 +104,46 @@ enum Commands {
     Uninstall {
         /// Package name (e.g. com.example.app)
         package: String,
+
+        /// Keep app data and cache directories
+        #[arg(short = 'k', long = "keep-data")]
+        keep_data: bool,
+    },
+
+    /// Android package manager: list, current/top, start, stop, uninstall, clear
+    #[command(alias = "app")]
+    Pm {
+        #[command(subcommand)]
+        subcommand: PmCommands,
+    },
+
+    /// List installed packages on the device (shortcut for `pm list`)
+    Apps {
+        /// Show only third-party (user installed) applications
+        #[arg(short = '3', long = "third-party")]
+        third_party: bool,
+
+        /// Filter packages by keyword
+        #[arg(short = 'f', long = "filter")]
+        filter: Option<String>,
+    },
+
+    /// Start / launch an application on the device (shortcut for `pm start`)
+    #[command(alias = "launch", alias = "run")]
+    Start {
+        /// Application package name (e.g. com.android.settings)
+        package: String,
+
+        /// Optional activity class name to launch directly
+        #[arg(short = 'a', long = "activity")]
+        activity: Option<String>,
+    },
+
+    /// Force stop / close an application on the device (shortcut for `pm stop`)
+    #[command(alias = "close", alias = "kill")]
+    Stop {
+        /// Application package name to force stop
+        package: String,
     },
 
     /// Reboot the device
@@ -152,6 +192,63 @@ enum Commands {
         /// Per-probe timeout in milliseconds (default: 800)
         #[arg(short = 't', long = "timeout", default_value = "800")]
         timeout_ms: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum PmCommands {
+    /// List installed application packages on the device
+    #[command(alias = "ls")]
+    List {
+        /// Show only third-party (user installed) applications
+        #[arg(short = '3', long = "third-party")]
+        third_party: bool,
+
+        /// Show only system applications
+        #[arg(short = 's', long = "system")]
+        system: bool,
+
+        /// Filter packages by keyword
+        #[arg(short = 'f', long = "filter")]
+        filter: Option<String>,
+    },
+
+    /// Show currently focused foreground application
+    #[command(alias = "top")]
+    Current,
+
+    /// Start/launch an application on the device
+    #[command(alias = "launch", alias = "run")]
+    Start {
+        /// Application package name (e.g. com.android.settings)
+        package: String,
+
+        /// Optional activity class name to launch directly
+        #[arg(short = 'a', long = "activity")]
+        activity: Option<String>,
+    },
+
+    /// Force stop / close an application
+    #[command(alias = "close", alias = "kill")]
+    Stop {
+        /// Application package name to force stop
+        package: String,
+    },
+
+    /// Uninstall an application from the device
+    Uninstall {
+        /// Application package name to uninstall
+        package: String,
+
+        /// Keep app data and cache directories
+        #[arg(short = 'k', long = "keep-data")]
+        keep_data: bool,
+    },
+
+    /// Clear application cache and user data
+    Clear {
+        /// Application package name to clear
+        package: String,
     },
 }
 
@@ -503,9 +600,9 @@ async fn main() {
                 }
             }
         }
-        Commands::Uninstall { package } => {
-            println!("Uninstalling {}...", package);
-            match device.uninstall(&package).await {
+        Commands::Uninstall { package, keep_data } => {
+            println!("Uninstalling {} (keep_data: {})...", package, keep_data);
+            match device.uninstall_package(&package, keep_data).await {
                 Ok(()) => println!("Success"),
                 Err(e) => {
                     eprintln!("Uninstall failed: {}", e);
@@ -513,6 +610,84 @@ async fn main() {
                 }
             }
         }
+        Commands::Apps { third_party, filter } => {
+            handle_pm_list(&device, third_party, false, filter.as_deref()).await;
+        }
+        Commands::Start { package, activity } => {
+            println!("Starting {}...", package);
+            match device.start_app(&package, activity.as_deref()).await {
+                Ok(()) => println!("Success: application started"),
+                Err(e) => {
+                    eprintln!("Start failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Stop { package } => {
+            println!("Stopping {}...", package);
+            match device.stop_app(&package).await {
+                Ok(()) => println!("Success: application stopped"),
+                Err(e) => {
+                    eprintln!("Stop failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        Commands::Pm { subcommand } => match subcommand {
+            PmCommands::List { third_party, system, filter } => {
+                handle_pm_list(&device, third_party, system, filter.as_deref()).await;
+            }
+            PmCommands::Current => {
+                match device.current_app().await {
+                    Ok(Some(app)) => println!("Foreground Application: {}", app),
+                    Ok(None) => println!("No active foreground application detected"),
+                    Err(e) => {
+                        eprintln!("Failed to get current app: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+            PmCommands::Start { package, activity } => {
+                println!("Starting {}...", package);
+                match device.start_app(&package, activity.as_deref()).await {
+                    Ok(()) => println!("Success: application started"),
+                    Err(e) => {
+                        eprintln!("Start failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+            PmCommands::Stop { package } => {
+                println!("Stopping {}...", package);
+                match device.stop_app(&package).await {
+                    Ok(()) => println!("Success: application stopped"),
+                    Err(e) => {
+                        eprintln!("Stop failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+            PmCommands::Uninstall { package, keep_data } => {
+                println!("Uninstalling {} (keep_data: {})...", package, keep_data);
+                match device.uninstall_package(&package, keep_data).await {
+                    Ok(()) => println!("Success"),
+                    Err(e) => {
+                        eprintln!("Uninstall failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+            PmCommands::Clear { package } => {
+                println!("Clearing data for {}...", package);
+                match device.clear_app_data(&package).await {
+                    Ok(()) => println!("Success: app data cleared"),
+                    Err(e) => {
+                        eprintln!("Clear failed: {}", e);
+                        process::exit(1);
+                    }
+                }
+            }
+        },
         Commands::Reboot { mode } => {
             let m: RebootMode = mode.into();
             println!("Rebooting device ({:?})...", m);
@@ -561,6 +736,52 @@ async fn main() {
                     process::exit(1);
                 }
             }
+        }
+    }
+}
+
+async fn handle_pm_list(
+    device: &AdbDevice,
+    third_party: bool,
+    system: bool,
+    filter: Option<&str>,
+) {
+    let tp_only = third_party && !system;
+    match device.list_packages(filter, tp_only).await {
+        Ok(mut pkgs) => {
+            if system && !third_party {
+                pkgs.retain(|p| p.is_system);
+            }
+            let label = if third_party && !system {
+                "Third-party (User)"
+            } else if system && !third_party {
+                "System"
+            } else {
+                "Installed"
+            };
+            println!("📱 {} Packages ({} total):\n", label, pkgs.len());
+            if pkgs.is_empty() {
+                println!("  (No packages matching criteria)");
+                return;
+            }
+
+            println!("┌─────┬────────────────────────────────────────────────────────┬─────────┐");
+            println!("│ {:<3} │ {:<54} │ {:<7} │", "#", "Package Name", "Type");
+            println!("├─────┼────────────────────────────────────────────────────────┼─────────┤");
+            for (i, p) in pkgs.iter().enumerate() {
+                let p_type = if p.is_system { "System" } else { "User" };
+                let display_name = if p.package_name.len() > 54 {
+                    &p.package_name[..54]
+                } else {
+                    &p.package_name
+                };
+                println!("│ {:<3} │ {:<54} │ {:<7} │", i + 1, display_name, p_type);
+            }
+            println!("└─────┴────────────────────────────────────────────────────────┴─────────┘");
+        }
+        Err(e) => {
+            eprintln!("Failed to list packages: {}", e);
+            process::exit(1);
         }
     }
 }
