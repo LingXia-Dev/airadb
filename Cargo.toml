@@ -11,18 +11,19 @@ categories = ["network-programming", "command-line-utilities", "development-tool
 
 [dependencies]
 tokio = { version = "1.43", features = ["io-util", "io-std", "net", "sync", "macros", "rt", "rt-multi-thread", "time", "fs"] }
-rsa = { version = "0.9", features = ["pem", "sha1"] }
-num-bigint = "0.4"
+rsa = { version = "0.10", features = ["pkcs1v15", "sha1"] }
+num-bigint = "0.5"
 num-traits = "0.2"
-sha1 = "0.10"
-base64 = "0.22"
+sha1 = "0.11"
+base64 = "0.23"
 byteorder = "1.5"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive"] }
-dirs = "6.0"
+dirs = "7.0"
 socket2 = "0.6"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["full", "test-util"] }

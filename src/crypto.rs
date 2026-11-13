@@ -2,14 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use base64::prelude::*;
 use byteorder::{ByteOrder, LittleEndian};
+use getrandom::SysRng;
 use num_bigint::BigUint;
 use num_traits::{One, ToPrimitive};
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
-use rsa::pkcs1v15::Pkcs1v15Sign;
-use rsa::rand_core::OsRng;
 use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::{PrivateKey, PublicKey};
+use sha1::Sha1;
 
 use crate::error::{AdbError, Result};
 
@@ -34,40 +34,39 @@ pub fn mod_inverse_u32(a: u32) -> u32 {
 /// RSA key pair for ADB authentication.
 #[derive(Clone)]
 pub struct AdbKeyPair {
-    private_key: RsaPrivateKey,
+    private_key: PrivateKey,
 }
 
 impl AdbKeyPair {
     /// Generates a new 2048-bit RSA key pair.
     pub fn generate() -> Result<Self> {
-        let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048)
+        let private_key = PrivateKey::new(&mut SysRng, 2048)
             .map_err(|e| AdbError::CryptoError(format!("Failed to generate RSA key: {}", e)))?;
         Ok(Self { private_key })
     }
 
-    /// Creates an `AdbKeyPair` from an existing `RsaPrivateKey`.
-    pub fn from_private_key(private_key: RsaPrivateKey) -> Self {
+    /// Creates an `AdbKeyPair` from an existing `PrivateKey`.
+    pub fn from_private_key(private_key: PrivateKey) -> Self {
         Self { private_key }
     }
 
-    /// Access the underlying `RsaPrivateKey`.
-    pub fn private_key(&self) -> &RsaPrivateKey {
+    /// Access the underlying `PrivateKey`.
+    pub fn private_key(&self) -> &PrivateKey {
         &self.private_key
     }
 
     /// Access the public key.
-    pub fn public_key(&self) -> RsaPublicKey {
-        RsaPublicKey::from(&self.private_key)
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey::from(&self.private_key)
     }
 
     /// Loads a private key from a PEM-encoded string (PKCS#8 or PKCS#1).
     pub fn from_pem(pem_str: &str) -> Result<Self> {
         // Try PKCS#8 first, then fallback to PKCS#1
-        if let Ok(key) = RsaPrivateKey::from_pkcs8_pem(pem_str) {
+        if let Ok(key) = PrivateKey::from_pkcs8_pem(pem_str) {
             return Ok(Self { private_key: key });
         }
-        if let Ok(key) = RsaPrivateKey::from_pkcs1_pem(pem_str) {
+        if let Ok(key) = PrivateKey::from_pkcs1_pem(pem_str) {
             return Ok(Self { private_key: key });
         }
         Err(AdbError::CryptoError("Failed to parse private key PEM (neither PKCS#8 nor PKCS#1)".into()))
@@ -118,13 +117,13 @@ impl AdbKeyPair {
     /// };
     /// ```
     pub fn android_pubkey_bytes(&self) -> Result<Vec<u8>> {
-        let n_bytes_le = self.private_key.n().to_bytes_le();
+        let n_bytes_le = self.private_key.n().as_ref().to_le_bytes();
         if n_bytes_le.len() > ANDROID_PUBKEY_MODULUS_SIZE {
             return Err(AdbError::CryptoError("Modulus exceeds 2048 bits".into()));
         }
         let n_biguint = BigUint::from_bytes_le(&n_bytes_le);
 
-        let e_bytes_le = self.private_key.e().to_bytes_le();
+        let e_bytes_le = self.private_key.e().to_le_bytes();
         let e_biguint = BigUint::from_bytes_le(&e_bytes_le);
 
         // n0 = n % 2^32
@@ -183,26 +182,15 @@ impl AdbKeyPair {
     /// Android's adbd expects an RSA PKCS#1 v1.5 signature over the SHA-1 DigestInfo
     /// wrapped token.
     pub fn sign_token(&self, token: &[u8]) -> Result<Vec<u8>> {
-        // Construct the ASN.1 DigestInfo prefix + 20-byte token
-        let mut digest_info = Vec::with_capacity(SHA1_DIGEST_INFO_PREFIX.len() + token.len());
-        digest_info.extend_from_slice(&SHA1_DIGEST_INFO_PREFIX);
-        digest_info.extend_from_slice(token);
-
-        let padding = Pkcs1v15Sign::new_unprefixed();
         self.private_key
-            .sign(padding, &digest_info)
+            .pkcs1v15_sign_prehash::<Sha1>(token)
             .map_err(|e| AdbError::CryptoError(format!("Failed to sign token: {}", e)))
     }
 
     /// Verifies a signature against the public key.
     pub fn verify_signature(&self, token: &[u8], signature: &[u8]) -> bool {
-        let mut digest_info = Vec::with_capacity(SHA1_DIGEST_INFO_PREFIX.len() + token.len());
-        digest_info.extend_from_slice(&SHA1_DIGEST_INFO_PREFIX);
-        digest_info.extend_from_slice(token);
-
         let pub_key = self.public_key();
-        let padding = Pkcs1v15Sign::new_unprefixed();
-        pub_key.verify(padding, &digest_info, signature).is_ok()
+        pub_key.pkcs1v15_verify_prehash::<Sha1>(token, signature).is_ok()
     }
 }
 
