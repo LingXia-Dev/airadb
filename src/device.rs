@@ -446,14 +446,16 @@ impl AdbDevice {
     pub async fn screencap(&self) -> Result<Vec<u8>> {
         const PNG_HEADER: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
-        // Try direct streaming via exec: first (fastest, no disk wear)
-        if let Ok(raw_png) = self.exec("screencap -p").await {
+        // Try direct streaming via exec: first (fastest, supported on Android 7+).
+        // Use a short timeout so legacy Android 5.0/5.1 devices that don't support
+        // exec: (or hang on open) immediately fall back to shell + sync pull.
+        if let Ok(Ok(raw_png)) = timeout(Duration::from_millis(1500), self.exec("screencap -p")).await {
             if raw_png.len() >= 8 && &raw_png[..8] == PNG_HEADER {
                 return Ok(raw_png);
             }
         }
 
-        // Fallback for Android 5.0 devices lacking exec: service
+        // Fallback for Android 5.0/5.1 devices lacking exec: service
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

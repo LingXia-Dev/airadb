@@ -91,7 +91,7 @@ pub async fn query_device_hardware_info(device: &AdbDevice) -> Result<DeviceHard
     let parts: Vec<&str> = raw.split("===AIRADB_").collect();
     for part in parts {
         if let Some((header, body)) = part.split_once("===") {
-            let body = body.trim_start_matches(|c| c == '\r' || c == '\n');
+            let body = body.trim_start_matches(['\r', '\n']);
             match header {
                 "DF" => df_section = body,
                 "AID" => aid_section = body,
