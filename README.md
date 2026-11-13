@@ -1,41 +1,40 @@
 # airadb
 
+[![crates.io](https://img.shields.io/crates/v/airadb.svg)](https://crates.io/crates/airadb)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platform-iOS%20|%20Android%20|%20HarmonyOS%20|%20macOS%20|%20Linux%20|%20Windows-lightgrey.svg)](Cargo.toml)
+
 A pure Rust ADB (Android Debug Bridge) client library and CLI tool designed for direct TCP connections to `adbd`.
 
-`airadb` is specifically tailored for cross-platform environments (including **iOS**, **Android**, macOS, Linux, and Windows) and legacy Android devices (**Android 5.0 Lollipop and above**).
+Targeting mobile/embedded embedding (**iOS, Android, HarmonyOS, macOS, Linux, Windows**) and legacy-to-modern Android devices (**Android 5.0 Lollipop through Android 15**).
 
 ---
 
-## Key Highlights
+## Features
 
-- **Pure Rust & Portable**: Zero C/C++ dependencies (no OpenSSL C-bindings, no cmake). Compiles smoothly for `aarch64-apple-ios`, `aarch64-linux-android`, desktop OSes, and embedded targets.
-- **Direct TCP Only**: Connects directly to `adbd` over TCP (`<device_ip>:5555`) without requiring a local Google ADB server daemon.
-- **Android 5+ Compatibility**:
-  - Full support for ADB Protocol v1 (`0x01000000` / `0x01000001`).
-  - Correct legacy byte-sum checksum calculation required by Android 5.
-  - Respects negotiated `max_payload` (e.g. 4096 bytes on older devices).
-  - Proper null-terminated service destination strings and RSA public key strings.
-  - Standard RSA-2048 authentication challenge signing (PKCS#1 v1.5 + SHA-1 DigestInfo) and Android binary `RSAPublicKey` structure generation.
-- **Persistent Multiplexed Connection**:
-  - A single TCP connection (`A_CNXN`) is established and kept alive.
-  - Multiple commands, shells, and file sync transfers are multiplexed sequentially or concurrently without reconnecting or re-authenticating.
-- **Lean & Focused**: Does not require wireless TLS pairing or mDNS discovery. Built specifically for connecting to existing and legacy Android devices reliably.
+- **Pure Rust & Zero C Dependencies**: No OpenSSL C-bindings, no CMake. Cross-compiles out-of-the-box (`aarch64-apple-ios`, `aarch64-linux-android`, `aarch64-unknown-linux-ohos`).
+- **Direct TCP Only**: Directly connects to `adbd` (`<ip>:<port>`), eliminating the need for a local Google ADB server daemon.
+- **Android 5.0+ to Modern Android 15**:
+  - Full ADB Protocol v1 framing with legacy byte-sum checksum handling (and modern checksum bypass).
+  - Respects negotiated `max_payload` (4 KB up to 1 MB).
+  - Pure Rust RSA-2048 keygen, token challenge signing, and Android `RSAPublicKey` structure format.
+- **Persistent Stream Multiplexing**: Multiple commands, interactive shells, and file sync streams run over a single persistent TCP connection (`A_CNXN`) with automatic TCP keepalive.
+- **Fast Network Discovery**: Combines mDNS multicast discovery (`_adb._tcp.local`) with concurrent TCP sweeping on common ports (`5555`, `9527`, `5566`).
+- **Sync & Async Interfaces**: Async Tokio API for high performance, plus `BlockingDevicePool` for synchronous FFI integration.
 
 ---
 
-## Library Usage
+## Installation & Library Usage
 
 Add `airadb` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 airadb = "0.1.0"
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.43", features = ["full"] }
 ```
 
-### 1. Basic Connection & Running Multiple Commands
-
-Notice that all commands reuse the **same TCP connection**:
+### Quick Example
 
 ```rust
 use airadb::AdbDevice;
@@ -45,208 +44,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connects to device over TCP and handles RSA authentication
     let device = AdbDevice::connect("192.168.1.100:5555").await?;
 
-    // Query device properties over the persistent connection
-    let model = device.get_model().await?;
-    let android_ver = device.get_android_version().await?;
-    println!("Device: {} (Android {})", model, android_ver);
+    // Query hardware & system information (~180ms compound query)
+    let info = device.get_hardware_info().await?;
+    println!("Device: {} (Android {}, CPU: {} cores)", info.model, info.android_version, info.cpu_cores);
 
-    // Run multiple shell commands without reconnecting
-    let output1 = device.shell("uptime").await?;
-    println!("Uptime: {}", output1.trim());
+    // Run shell commands over the persistent connection
+    let output = device.shell("uptime").await?;
+    println!("Uptime: {}", output.trim());
 
-    let output2 = device.shell("pm list packages -3").await?;
-    println!("Third-party packages:\n{}", output2);
+    // File Sync: Push and Pull
+    device.push_file("local.apk", "/data/local/tmp/app.apk").await?;
+    device.pull_file("/sdcard/shot.png", "pulled.png").await?;
 
-    Ok(())
-}
-```
-
-### 2. File Synchronization (Push & Pull)
-
-File transfers use the binary ADB `sync:` protocol over the persistent connection:
-
-```rust
-use airadb::AdbDevice;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = AdbDevice::connect("192.168.1.100:5555").await?;
-
-    // Stat remote file
-    let stat = device.stat("/sdcard/Download").await?;
-    if stat.exists() {
-        println!("Download dir mode: {:#o}, size: {}", stat.mode, stat.size);
-    }
-
-    // List remote directory
-    let entries = device.list("/sdcard/Download").await?;
-    for entry in entries {
-        println!("{:<10} {:>8} bytes {}", entry.mode, entry.size, entry.name);
-    }
-
-    // Push local file to device
-    let bytes_pushed = device.push_file("local_app.apk", "/data/local/tmp/app.apk").await?;
-    println!("Pushed {} bytes", bytes_pushed);
-
-    // Pull remote file to local
-    let bytes_pulled = device.pull_file("/sdcard/screenshot.png", "pulled.png").await?;
-    println!("Pulled {} bytes", bytes_pulled);
+    // Screencap (streaming exec: with automatic Android 5.0 fallback)
+    let png_bytes = device.screencap().await?;
+    std::fs::write("screenshot.png", png_bytes)?;
 
     Ok(())
 }
 ```
 
-### 3. Raw Execution (No PTY Mangling)
+### Device Pool & Synchronous FFI
 
-Ideal for binary outputs such as taking screenshots:
-
-```rust
-use airadb::AdbDevice;
-use tokio::fs;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = AdbDevice::connect("192.168.1.100:5555").await?;
-
-    // Capture screenshot as raw PNG bytes
-    let png_bytes = device.exec("screencap -p").await?;
-    fs::write("screenshot.png", png_bytes).await?;
-    println!("Saved screenshot.png");
-
-    Ok(())
-}
-```
-
-### 4. In-Memory Byte Push & Device Connection Pool
-
-For tools that manage multiple devices (like `mukeinstall`), `airadb` provides `DevicePool` and `BlockingDevicePool` which maintain persistent connections by `SocketAddr`:
+For multi-device management or synchronous C/FFI environments (e.g. `mukeinstall`):
 
 ```rust
-use airadb::pool::DevicePool;
+use airadb::BlockingDevicePool;
 use std::net::SocketAddr;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let pool = DevicePool::new();
-    let addr: SocketAddr = "192.168.1.100:5555".parse()?;
+let pool = BlockingDevicePool::new();
+let addr: SocketAddr = "192.168.1.100:5555".parse().unwrap();
 
-    // Push in-memory binary without temporary files
-    let agent_bytes = include_bytes!("../assets/muke-util");
-    pool.push_bytes(addr, None, agent_bytes, "/data/local/tmp/muke-util").await?;
-
-    // Subsequent commands reuse the same existing connection
-    let model = pool.shell(addr, None, "getprop ro.product.model").await?;
-    println!("Model: {}", model.trim());
-
-    Ok(())
-}
-```
-
-### 5. Synchronous / Blocking API (for FFI / Non-Async Traits)
-
-If your app uses synchronous traits (e.g. `mukeinstall-lib`'s `AdbBackend`), you can use `airadb::blocking::BlockingDevicePool`:
-
-```rust
-use airadb::blocking::BlockingDevicePool;
-use std::net::SocketAddr;
-use std::path::Path;
-
-fn run_sync(addr: SocketAddr, key_path: &Path) {
-    let pool = BlockingDevicePool::new();
-
-    // Directly call synchronous methods from any thread
-    let output = pool.shell(addr, key_path, "uname -a").unwrap();
-    println!("Stdout: {}", output.stdout_string_lossy());
-
-    pool.push(addr, key_path, b"data", "/data/local/tmp/test.txt").unwrap();
-}
-```
-
-### 6. Local Network Device Discovery (TCP Probe)
-
-Discover ADB devices on your local network without relying on ICMP ping (which is frequently blocked by TV boxes and router isolation):
-
-```rust
-use airadb::scan::{scan_devices, ScanOptions};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Automatically detects local subnet (e.g. 192.168.1.0/24) and probes port 5555
-    let devices = scan_devices(ScanOptions::default()).await?;
-
-    for dev in devices {
-        println!("Found: {} model={:?} auth={}", dev.addr, dev.model, dev.authorized);
-    }
-    Ok(())
-}
+// Synchronously run commands from any thread without async runtime
+let output = pool.shell(addr, None, "uname -a").unwrap();
+pool.push(addr, None, b"binary_payload", "/data/local/tmp/agent").unwrap();
 ```
 
 ---
 
-## CLI Tool
-
-`airadb` comes with a command-line binary.
-
-### Installation
+## CLI Usage
 
 ```bash
-cargo install --path .
-```
-
-### Global Options
-
-- `-s, --server <IP:PORT>`: Target device TCP address (default: `127.0.0.1:5555`).
-- `-k, --key <PATH>`: Custom private key path (defaults to `~/.android/adbkey` or auto-generated).
-- `-v, --verbose`: Enable debug/trace logging.
-
-### Examples
-
-```bash
-# Scan local network for ADB devices (auto-detects subnet, probes port 5555)
+# Scan network for ADB devices (ports 5555, 9527, 5566 + mDNS)
 airadb scan
 
-# Scan custom subnet and specific ports
-airadb scan --subnet 192.168.1.0/24 --ports 5555,55555
-
-# Test connection and show device info
-airadb -s 192.168.1.100:5555 connect
-
-# Query comprehensive hardware info (CPU, RAM, storage, Android OS, GPU)
+# Connect & query detailed hardware information
 airadb -s 192.168.1.100:5555 info
 
-# Capture screenshot directly
+# Capture screenshot directly to local PNG
 airadb -s 192.168.1.100:5555 screencap screen.png
 
-# Run a shell command
-airadb -s 192.168.1.100:5555 shell getprop ro.product.model
+# Shell execution
+airadb -s 192.168.1.100:5555 shell "getprop ro.product.model"
+airadb -s 192.168.1.100:5555 shell   # Interactive shell
 
-# Start an interactive shell session
-airadb -s 192.168.1.100:5555 shell
+# File operations & App installation
+airadb -s 192.168.1.100:5555 push app.apk /data/local/tmp/
+airadb -s 192.168.1.100:5555 pull /sdcard/log.txt
+airadb -s 192.168.1.100:5555 install app-release.apk
 
-# Run exec command (raw binary stdout)
-airadb -s 192.168.1.100:5555 exec screencap -p > screenshot.png
-
-# Push and Pull files
-airadb -s 192.168.1.100:5555 push local_video.mp4 /sdcard/Movies/
-airadb -s 192.168.1.100:5555 pull /sdcard/Movies/local_video.mp4
-
-# Check file stat and list directory
-airadb -s 192.168.1.100:5555 stat /sdcard/Movies
-airadb -s 192.168.1.100:5555 ls /sdcard/Movies
-
-# Install an APK
-airadb -s 192.168.1.100:5555 install app-debug.apk
-
-# Reboot device
-airadb -s 192.168.1.100:5555 reboot recovery
-
-# Remount filesystem as RW
-airadb -s 192.168.1.100:5555 remount
-
-# Switch adbd TCP port
+# Management
+airadb -s 192.168.1.100:5555 reboot [system|bootloader|recovery]
 airadb -s 192.168.1.100:5555 tcpip 5555
-
-# Generate an ADB RSA keypair
 airadb keygen ~/.android/adbkey
 ```
 
