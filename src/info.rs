@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::device::AdbDevice;
+use crate::device::Device;
 use crate::error::Result;
 
 /// Comprehensive hardware and system information of an Android device.
@@ -75,11 +75,11 @@ impl fmt::Display for DeviceHardwareInfo {
 ///
 /// Executes an optimized single batch command across the persistent stream to fetch
 /// `/proc/meminfo`, `df`, `settings get secure android_id`, and `getprop` in one network round-trip.
-pub async fn query_device_hardware_info(device: &AdbDevice) -> Result<DeviceHardwareInfo> {
+pub(crate) async fn query_device_hardware_info(device: &Device) -> Result<DeviceHardwareInfo> {
     // Combine queries into a single shell execution to minimize latency
     let compound_cmd = "cat /proc/meminfo; echo '===AIRADB_DF==='; df /data; echo '===AIRADB_AID==='; settings get secure android_id 2>/dev/null; echo '===AIRADB_CPU==='; cat /sys/devices/system/cpu/possible 2>/dev/null; cat /proc/cpuinfo; echo '===AIRADB_PROPS==='; getprop";
 
-    let raw = device.shell(compound_cmd).await?;
+    let raw = device.shell_raw(compound_cmd).await?;
 
     let mut meminfo_section = "";
     let mut df_section = "";

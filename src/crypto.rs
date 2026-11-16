@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use base64::prelude::*;
 use byteorder::{ByteOrder, LittleEndian};
 use getrandom::SysRng;
@@ -11,19 +11,14 @@ use rsa::traits::PublicKeyParts;
 use rsa::{PrivateKey, PublicKey};
 use sha1::Sha1;
 
-use crate::error::{AdbError, Result};
+use crate::error::{Error, Result};
 
-pub const ANDROID_PUBKEY_MODULUS_SIZE: usize = 256; // 2048 bits
-pub const ANDROID_PUBKEY_MODULUS_WORDS: usize = 64;  // 64 * 32 bits
-pub const ANDROID_PUBKEY_ENCODED_SIZE: usize = 524; // 3 * 4 + 2 * 256
-
-// SHA-1 ASN.1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
-pub const SHA1_DIGEST_INFO_PREFIX: [u8; 15] = [
-    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
-];
+pub(crate) const ANDROID_PUBKEY_MODULUS_SIZE: usize = 256; // 2048 bits
+pub(crate) const ANDROID_PUBKEY_MODULUS_WORDS: usize = 64;  // 64 * 32 bits
+pub(crate) const ANDROID_PUBKEY_ENCODED_SIZE: usize = 524; // 3 * 4 + 2 * 256
 
 /// Computes modular inverse mod 2^32 for an odd 32-bit integer.
-pub fn mod_inverse_u32(a: u32) -> u32 {
+fn mod_inverse_u32(a: u32) -> u32 {
     let mut x = 1u32;
     for _ in 0..5 {
         x = x.wrapping_mul(2u32.wrapping_sub(a.wrapping_mul(x)));
@@ -33,19 +28,19 @@ pub fn mod_inverse_u32(a: u32) -> u32 {
 
 /// RSA key pair for ADB authentication.
 #[derive(Clone)]
-pub struct AdbKeyPair {
+pub struct KeyPair {
     private_key: PrivateKey,
 }
 
-impl AdbKeyPair {
+impl KeyPair {
     /// Generates a new 2048-bit RSA key pair.
     pub fn generate() -> Result<Self> {
         let private_key = PrivateKey::new(&mut SysRng, 2048)
-            .map_err(|e| AdbError::CryptoError(format!("Failed to generate RSA key: {}", e)))?;
+            .map_err(|e| Error::key(format!("Failed to generate RSA key: {}", e)))?;
         Ok(Self { private_key })
     }
 
-    /// Creates an `AdbKeyPair` from an existing `PrivateKey`.
+    /// Creates an `KeyPair` from an existing `PrivateKey`.
     pub fn from_private_key(private_key: PrivateKey) -> Self {
         Self { private_key }
     }
@@ -69,13 +64,13 @@ impl AdbKeyPair {
         if let Ok(key) = PrivateKey::from_pkcs1_pem(pem_str) {
             return Ok(Self { private_key: key });
         }
-        Err(AdbError::CryptoError("Failed to parse private key PEM (neither PKCS#8 nor PKCS#1)".into()))
+        Err(Error::key("Failed to parse private key PEM (neither PKCS#8 nor PKCS#1)"))
     }
 
     /// Loads a private key from a file.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = fs::read_to_string(path.as_ref())
-            .map_err(|e| AdbError::CryptoError(format!("Failed to read key file: {}", e)))?;
+            .map_err(|e| Error::key(format!("cannot read {}: {}", path.as_ref().display(), e)))?;
         Self::from_pem(&content)
     }
 
@@ -83,7 +78,7 @@ impl AdbKeyPair {
     pub fn to_pkcs8_pem(&self) -> Result<String> {
         self.private_key
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-            .map_err(|e| AdbError::CryptoError(format!("Failed to export PKCS#8 PEM: {}", e)))
+            .map_err(|e| Error::key(format!("Failed to export PKCS#8 PEM: {}", e)))
             .map(|zeroizing| zeroizing.as_str().to_string())
     }
 
@@ -94,13 +89,15 @@ impl AdbKeyPair {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, pem)?;
-
+        // Write-then-rename so a crash never leaves a truncated key.
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, pem)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         }
+        fs::rename(&tmp, path)?;
 
         Ok(())
     }
@@ -119,7 +116,7 @@ impl AdbKeyPair {
     pub fn android_pubkey_bytes(&self) -> Result<Vec<u8>> {
         let n_bytes_le = self.private_key.n().as_ref().to_le_bytes();
         if n_bytes_le.len() > ANDROID_PUBKEY_MODULUS_SIZE {
-            return Err(AdbError::CryptoError("Modulus exceeds 2048 bits".into()));
+            return Err(Error::key("Modulus exceeds 2048 bits"));
         }
         let n_biguint = BigUint::from_bytes_le(&n_bytes_le);
 
@@ -132,7 +129,7 @@ impl AdbKeyPair {
         let n0 = n0_rem.to_u32().unwrap_or(0);
 
         if n0.is_multiple_of(2) {
-            return Err(AdbError::CryptoError("Modulus is even, invalid RSA key".into()));
+            return Err(Error::key("Modulus is even, invalid RSA key"));
         }
 
         // n0inv = -1 / n[0] mod 2^32 = 0 - inv(n0)
@@ -144,7 +141,7 @@ impl AdbKeyPair {
         let rr = (&r * &r) % &n_biguint;
         let rr_bytes_le = rr.to_bytes_le();
         if rr_bytes_le.len() > ANDROID_PUBKEY_MODULUS_SIZE {
-            return Err(AdbError::CryptoError("R^2 mod n exceeds 2048 bits".into()));
+            return Err(Error::key("R^2 mod n exceeds 2048 bits"));
         }
 
         let exponent = e_biguint.to_u32().unwrap_or(65537);
@@ -184,7 +181,7 @@ impl AdbKeyPair {
     pub fn sign_token(&self, token: &[u8]) -> Result<Vec<u8>> {
         self.private_key
             .pkcs1v15_sign_prehash::<Sha1>(token)
-            .map_err(|e| AdbError::CryptoError(format!("Failed to sign token: {}", e)))
+            .map_err(|e| Error::key(format!("Failed to sign token: {}", e)))
     }
 
     /// Verifies a signature against the public key.
@@ -194,71 +191,36 @@ impl AdbKeyPair {
     }
 }
 
-/// Default path for ADB private key: `~/.android/adbkey`
-pub fn default_key_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|mut h| {
-        h.push(".android");
-        h.push("adbkey");
-        h
-    })
-}
-
-/// Loads key from default path if it exists, otherwise creates and saves a new keypair.
-pub fn load_or_generate_default_key() -> Result<AdbKeyPair> {
-    if let Some(path) = default_key_path() {
-        if path.exists() {
-            if let Ok(key) = AdbKeyPair::from_file(&path) {
-                return Ok(key);
-            }
-        }
-        // Generate new key and try saving it
-        let key = AdbKeyPair::generate()?;
-        let _ = key.save_to_file(&path);
-        // Also save .pub
-        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
-            let pub_path = path.with_extension("pub");
-            let _ = fs::write(pub_path, pub_str.trim_end_matches('\0'));
-        }
-        Ok(key)
-    } else {
-        AdbKeyPair::generate()
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyPair(..)")
     }
 }
 
-/// Loads a keypair from a file or directory path (such as `.adb_home`), generating one if absent.
-pub fn load_or_create_from_path<P: AsRef<Path>>(path: P) -> Result<AdbKeyPair> {
-    let p = path.as_ref();
-    if p.is_dir() {
-        // Try known key filenames in directory
-        let candidates = [
-            p.join("adbkey"),
-            p.join(".android").join("adbkey"),
-        ];
-        for candidate in &candidates {
-            if candidate.exists() {
-                if let Ok(key) = AdbKeyPair::from_file(candidate) {
-                    return Ok(key);
-                }
+impl KeyPair {
+    /// Load the key at `path` (PKCS#8 or PKCS#1 PEM), or create one there
+    /// (plus `<path>.pub` in adb's format) if the file does not exist.
+    ///
+    /// If `path` is a directory, `<dir>/adbkey` is used. An existing file
+    /// that cannot be parsed is an error, never silently replaced: a new key
+    /// would make every device ask for authorization again.
+    pub fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let file = if path.is_dir() { path.join("adbkey") } else { path.to_path_buf() };
+        match fs::read_to_string(&file) {
+            Ok(pem) => Self::from_pem(&pem)
+                .map_err(|e| Error::key(format!("{} is not a usable key: {}", file.display(), e.message()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = Self::generate()?;
+                key.save_to_file(&file)
+                    .map_err(|e| Error::key(format!("cannot save key to {}: {}", file.display(), e.message())))?;
+                let public = key.android_pubkey_string("airadb@client")?;
+                fs::write(file.with_extension("pub"), public.trim_end_matches('\0'))
+                    .map_err(|e| Error::key(format!("cannot save public key next to {}: {e}", file.display())))?;
+                Ok(key)
             }
+            Err(e) => Err(Error::key(format!("cannot read {}: {e}", file.display()))),
         }
-        // None found in directory, create in p/adbkey
-        let key_path = p.join("adbkey");
-        let key = AdbKeyPair::generate()?;
-        let _ = key.save_to_file(&key_path);
-        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
-            let _ = fs::write(key_path.with_extension("pub"), pub_str.trim_end_matches('\0'));
-        }
-        Ok(key)
-    } else if p.exists() {
-        AdbKeyPair::from_file(p)
-    } else {
-        // File doesn't exist yet, generate and save
-        let key = AdbKeyPair::generate()?;
-        let _ = key.save_to_file(p);
-        if let Ok(pub_str) = key.android_pubkey_string("airadb@client") {
-            let _ = fs::write(p.with_extension("pub"), pub_str.trim_end_matches('\0'));
-        }
-        Ok(key)
     }
 }
 
@@ -277,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_keygen_and_sign_verify() {
-        let key = AdbKeyPair::generate().unwrap();
+        let key = KeyPair::generate().unwrap();
         let token = b"12345678901234567890"; // 20 bytes token
         let sig = key.sign_token(token).unwrap();
         assert_eq!(sig.len(), 256); // 2048-bit RSA signature length is 256 bytes
@@ -291,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_android_pubkey_format() {
-        let key = AdbKeyPair::generate().unwrap();
+        let key = KeyPair::generate().unwrap();
         let pub_bytes = key.android_pubkey_bytes().unwrap();
         assert_eq!(pub_bytes.len(), ANDROID_PUBKEY_ENCODED_SIZE);
 
@@ -306,12 +268,27 @@ mod tests {
     }
 
     #[test]
+    fn load_or_create_persists_and_refuses_garbage() {
+        let dir = std::env::temp_dir().join(format!("airadb-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = KeyPair::load_or_create(&dir).unwrap();
+        assert!(dir.join("adbkey").exists() && dir.join("adbkey.pub").exists());
+        let again = KeyPair::load_or_create(dir.join("adbkey")).unwrap();
+        assert_eq!(first.private_key().n(), again.private_key().n());
+
+        fs::write(dir.join("adbkey"), "garbage").unwrap();
+        assert_eq!(KeyPair::load_or_create(&dir).unwrap_err().kind(), crate::ErrorKind::Key);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_pem_roundtrip() {
-        let key = AdbKeyPair::generate().unwrap();
+        let key = KeyPair::generate().unwrap();
         let pem = key.to_pkcs8_pem().unwrap();
         assert!(pem.contains("BEGIN PRIVATE KEY"));
 
-        let loaded = AdbKeyPair::from_pem(&pem).unwrap();
+        let loaded = KeyPair::from_pem(&pem).unwrap();
         assert_eq!(key.private_key().n(), loaded.private_key().n());
         assert_eq!(key.private_key().d(), loaded.private_key().d());
     }

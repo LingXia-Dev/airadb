@@ -20,65 +20,85 @@ Targeting mobile/embedded embedding (**iOS, Android, HarmonyOS, macOS, Linux, Wi
   - Pure Rust RSA-2048 keygen, token challenge signing, and Android `RSAPublicKey` structure format.
 - **Persistent Stream Multiplexing**: Multiple commands, interactive shells, and file sync streams run over a single persistent TCP connection (`A_CNXN`) with automatic TCP keepalive.
 - **Fast Network Discovery**: Combines mDNS multicast discovery (`_adb._tcp.local`) with concurrent TCP sweeping on common ports (`5555`, `9527`, `5566`).
-- **Sync & Async Interfaces**: Async Tokio API for high performance, plus `BlockingDevicePool` for synchronous FFI integration.
+- **Explicit authorization**: connecting only *signs* with your key, so an untrusted device fails fast with `ErrorKind::Unauthorized` and shows nothing. Only `authorize()` makes it ask "Allow USB debugging?".
+- **Safe shell arguments**: `shell("pm").arg(x)` quotes every argument; `shell_raw` is the explicit escape hatch.
+- **Embeddable**: `default-features = false` drops the CLI deps (clap, dirs, tracing-subscriber). Optional `blocking` and `serde` features.
 
 ---
 
-## Installation & Library Usage
-
-Add `airadb` to your `Cargo.toml`:
+## Library
 
 ```toml
 [dependencies]
-airadb = "0.1.0"
-tokio = { version = "1.43", features = ["full"] }
+airadb = { version = "0.3", default-features = false }
 ```
 
-### Quick Example
+### Design
+
+- `Client` holds the key and all timeouts. It never reads `~/.android/adbkey` on its own; load a key with `KeyPair::load_or_create(path)`, which creates it if missing and **errors** (never silently regenerates) if it is unreadable.
+- `client.device(addr)` returns a cheap, cloneable `Device` and sends nothing. Handles for the same address share one multiplexed connection, opened on first use and closed after `idle_timeout` (default 60s) with no open streams.
+- Every error is an `airadb::Error` with a `kind()` to branch on (`Unreachable`, `Timeout`, `Unauthorized`, `Disconnected`, `Rejected`, `InstallFailed`, `InvalidArg`, `Protocol`, `Key`, …) and `is_retryable()`.
+- Every network step has a timeout: TCP connect 3s, each handshake reply / service open 5s, the user's authorization 30s (all configurable on `Client::builder`).
+
+### Connect and control
 
 ```rust
-use airadb::AdbDevice;
+use airadb::{Authorization, Client, Key, KeyPair, PackageName};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Connects to device over TCP and handles RSA authentication
-    let device = AdbDevice::connect("192.168.1.100:5555").await?;
+# async fn demo() -> airadb::Result<()> {
+let client = Client::new(KeyPair::load_or_create("adbkey")?);
+let tv = client.device("192.168.1.100:5555".parse().unwrap());
 
-    // Query hardware & system information (~180ms compound query)
-    let info = device.get_hardware_info().await?;
-    println!("Device: {} (Android {}, CPU: {} cores)", info.model, info.android_version, info.cpu_cores);
-
-    // Run shell commands over the persistent connection
-    let output = device.shell("uptime").await?;
-    println!("Uptime: {}", output.trim());
-
-    // File Sync: Push and Pull
-    device.push_file("local.apk", "/data/local/tmp/app.apk").await?;
-    device.pull_file("/sdcard/shot.png", "pulled.png").await?;
-
-    // Screencap (streaming exec: with automatic Android 5.0 fallback)
-    let png_bytes = device.screencap().await?;
-    std::fs::write("screenshot.png", png_bytes)?;
-
-    Ok(())
+// First time only: the device shows "Allow USB debugging?".
+if let Authorization::Waiting(prompt) = tv.authorize().await? {
+    prompt.wait().await?; // ErrorKind::Unauthorized if declined or ignored
 }
+
+tv.press(Key::Home).await?;
+let pkg: PackageName = "com.android.settings".parse()?;
+tv.launch(&pkg).await?;
+if let Some(fg) = tv.foreground().await? {
+    println!("focused: {}", fg.package);
+}
+let model = tv.shell("getprop").arg("ro.product.model").await?;
+let png = tv.screencap().await?;
+# Ok(()) }
 ```
 
-### Device Pool & Synchronous FFI
-
-For multi-device management or synchronous C/FFI environments (e.g. `mukeinstall`):
+### Install
 
 ```rust
-use airadb::BlockingDevicePool;
-use std::net::SocketAddr;
-
-let pool = BlockingDevicePool::new();
-let addr: SocketAddr = "192.168.1.100:5555".parse().unwrap();
-
-// Synchronously run commands from any thread without async runtime
-let output = pool.shell(addr, None, "uname -a").unwrap();
-pool.push(addr, None, b"binary_payload", "/data/local/tmp/agent").unwrap();
+# async fn demo(tv: airadb::Device) -> airadb::Result<()> {
+tv.install("app-release.apk")
+    .on_progress(|sent, total| eprint!("\r{sent}/{total}"))
+    .await?; // ErrorKind::InstallFailed carries pm's message
+# Ok(()) }
 ```
+
+The APK is pushed to `/data/local/tmp/`, installed with `pm install -r` and removed, also when the future is dropped half-way.
+
+### Discovery
+
+```rust
+# async fn demo(client: airadb::Client) -> airadb::Result<()> {
+// Everything at once (default: local /24, ports 5555/9527/5566 + mDNS, 3s).
+for d in client.discover().await? {
+    println!("{} {:?} auth_required={}", d.addr, d.model, d.auth_required);
+}
+
+// Or as they answer; dropping the stream stops all probes.
+let mut found = client.discover().subnet("192.168.1".parse()?).start()?;
+while let Some(d) = found.next().await {
+    println!("{}", d.addr);
+}
+# Ok(()) }
+```
+
+Probing sends `CNXN` and reads the reply; it never offers a key, so no device shows a dialog.
+
+### Blocking
+
+With the `blocking` feature, `blocking::BlockingClient` wraps a `Client` for callers without an async runtime.
 
 ---
 
@@ -88,8 +108,10 @@ pool.push(addr, None, b"binary_payload", "/data/local/tmp/agent").unwrap();
 # Scan network for ADB devices (ports 5555, 9527, 5566 + mDNS)
 airadb scan
 
-# Connect & query detailed hardware information
+# Connect (accept the prompt on the device the first time) & query hardware info
+airadb -s 192.168.1.100:5555 connect
 airadb -s 192.168.1.100:5555 info
+airadb -s 192.168.1.100 press home down enter
 
 # Capture screenshot directly to local PNG
 airadb -s 192.168.1.100:5555 screencap screen.png
@@ -108,6 +130,8 @@ airadb -s 192.168.1.100:5555 reboot [system|bootloader|recovery]
 airadb -s 192.168.1.100:5555 tcpip 5555
 airadb keygen ~/.android/adbkey
 ```
+
+The CLI uses `~/.android/adbkey` (override with `-k`), creating it if missing. When the device does not trust the key yet, the CLI asks it to and waits up to 30s.
 
 ---
 

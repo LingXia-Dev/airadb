@@ -4,7 +4,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::{AdbError, Result};
+use crate::error::{Error, Result};
 use crate::stream::AdbStream;
 
 // Sync Protocol IDs (little endian)
@@ -90,7 +90,7 @@ impl AdbSync {
 
         let id = LittleEndian::read_u32(&resp[0..4]);
         if id != ID_STAT {
-            return Err(AdbError::SyncError(format!(
+            return Err(Error::rejected(format!(
                 "Expected ID_STAT, got {:#x}",
                 id
             )));
@@ -129,7 +129,7 @@ impl AdbSync {
             }
 
             if id != ID_DENT {
-                return Err(AdbError::SyncError(format!(
+                return Err(Error::rejected(format!(
                     "Expected ID_DENT or ID_DONE, got {:#x}",
                     id
                 )));
@@ -193,12 +193,12 @@ impl AdbSync {
                 let mut err_buf = vec![0u8; len];
                 self.read_exact(&mut err_buf).await?;
                 let err_msg = String::from_utf8_lossy(&err_buf);
-                return Err(AdbError::SyncError(format!(
+                return Err(Error::rejected(format!(
                     "Pull failed on device: {}",
                     err_msg
                 )));
             } else {
-                return Err(AdbError::SyncError(format!(
+                return Err(Error::rejected(format!(
                     "Unexpected sync response: {:#x}",
                     id
                 )));
@@ -284,12 +284,12 @@ impl AdbSync {
             let mut err_buf = vec![0u8; msg_len];
             self.read_exact(&mut err_buf).await?;
             let err_msg = String::from_utf8_lossy(&err_buf);
-            Err(AdbError::SyncError(format!(
+            Err(Error::rejected(format!(
                 "Push failed on device: {}",
                 err_msg
             )))
         } else {
-            Err(AdbError::SyncError(format!(
+            Err(Error::rejected(format!(
                 "Unexpected response to ID_DONE: {:#x}",
                 resp_id
             )))
@@ -350,7 +350,7 @@ impl AdbSync {
         while offset < buf.len() {
             let n = self.stream.read(&mut buf[offset..]).await?;
             if n == 0 {
-                return Err(AdbError::ConnectionClosed);
+                return Err(Error::disconnected());
             }
             offset += n;
         }

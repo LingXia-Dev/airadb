@@ -1,255 +1,114 @@
-use std::io::{Read, Write};
+//! A synchronous wrapper for callers without an async runtime
+//! (`blocking` feature). Each call runs on a small private runtime.
+
 use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
 use tokio::runtime::Runtime;
 
-use crate::crypto::load_or_create_from_path;
-use crate::device::ShellOutput;
-use crate::error::Result;
-use crate::pool::DevicePool;
+use crate::{Client, Device, DeviceHardwareInfo, DiscoveredDevice, Key, PackageName, Result};
 
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn get_runtime() -> &'static Runtime {
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
-            .thread_name("airadb-runtime")
+            .thread_name("airadb-blocking")
             .build()
-            .expect("Failed to initialize airadb background tokio runtime")
+            .expect("cannot start the airadb runtime")
     })
 }
 
-/// Synchronous (blocking) connection pool for environments that cannot use `async`/`await` directly.
-///
-/// Internally uses a dedicated background Tokio runtime to drive async I/O.
-#[derive(Clone, Default)]
-pub struct BlockingDevicePool {
-    pool: DevicePool,
+/// Blocking counterpart of [`Client`]. Must not be used from inside an
+/// async runtime.
+#[derive(Clone)]
+pub struct BlockingClient {
+    client: Client,
 }
 
-impl BlockingDevicePool {
-    /// Creates a new `BlockingDevicePool`.
-    pub fn new() -> Self {
-        Self {
-            pool: DevicePool::new(),
-        }
+impl BlockingClient {
+    pub fn new(client: Client) -> Self {
+        Self { client }
     }
 
-    /// Executes a shell command synchronously on `addr`, caching and reusing the TCP connection.
-    pub fn shell(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        command: &str,
-    ) -> Result<ShellOutput> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(async {
-            self.pool.shell_output(addr, Some(&key), command).await
-        })
+    pub fn device(&self, addr: SocketAddr) -> BlockingDevice {
+        // The device's reaper task must live on the runtime that drives it.
+        let _guard = runtime().enter();
+        BlockingDevice { device: Arc::new(self.client.device(addr)) }
     }
 
-    /// Executes a shell command synchronously and validates its exit code.
-    pub fn shell_checked(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        command: &str,
-    ) -> Result<String> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.shell_checked(addr, Some(&key), command))
+    pub fn discover(&self) -> Result<Vec<DiscoveredDevice>> {
+        let discover = self.client.discover();
+        runtime().block_on(async move { discover.await })
+    }
+}
+
+/// Blocking counterpart of [`Device`].
+#[derive(Clone)]
+pub struct BlockingDevice {
+    device: Arc<Device>,
+}
+
+impl BlockingDevice {
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
-    /// Checks if an executable command exists in PATH on `addr`.
-    pub fn has_command(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        cmd: &str,
-    ) -> bool {
-        if let Ok(key) = load_or_create_from_path(key_path) {
-            get_runtime().block_on(self.pool.has_command(addr, Some(&key), cmd))
-        } else {
-            false
-        }
+    pub fn connect(&self) -> Result<()> {
+        runtime().block_on(self.device.connect())
     }
 
-    /// Pushes in-memory bytes to `remote_path` on `addr` synchronously.
-    pub fn push(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        bytes: &[u8],
-        remote_path: &str,
-    ) -> Result<()> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(async {
-            let _ = self.pool.push_bytes(addr, Some(&key), bytes, remote_path).await?;
-            Ok(())
-        })
+    /// Run a command line as is (caller quotes).
+    pub fn shell_raw(&self, command: &str) -> Result<String> {
+        runtime().block_on(self.device.shell_raw(command))
     }
 
-    /// Pumps synchronous `stdin` into a remote `exec:` daemon and streams output to `stdout`.
-    ///
-    /// Ideal for driving on-device agent binaries (like `mukeinstall-device-util`).
-    pub fn exec(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        command: &str,
-        stdin: &mut dyn Read,
-        mut stdout: Box<dyn Write + Send>,
-    ) -> Result<()> {
-        let key = load_or_create_from_path(key_path)?;
-        let rt = get_runtime();
-
-        let device = rt.block_on(async {
-            self.pool.get_or_connect(addr, Some(&key)).await
-        })?;
-
-        let stream = rt.block_on(async {
-            device.exec_stream(command).await
-        })?;
-
-        let (mut stream_r, mut stream_w) = tokio::io::split(stream);
-
-        // Spawn stdout drainer task in runtime
-        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-        let read_handle = rt.spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 4096];
-            loop {
-                match stream_r.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stdout_tx.send(buf[..n].to_vec()).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // Drain stdout in background thread
-        let stdout_thread = std::thread::spawn(move || -> std::io::Result<()> {
-            while let Some(chunk) = stdout_rx.blocking_recv() {
-                stdout.write_all(&chunk)?;
-                stdout.flush()?;
-            }
-            Ok(())
-        });
-
-        // Pump stdin synchronously
-        let mut stdin_buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut stdin_buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    use tokio::io::AsyncWriteExt;
-                    let chunk = stdin_buf[..n].to_vec();
-                    let res = rt.block_on(async {
-                        stream_w.write_all(&chunk).await
-                    });
-                    if res.is_err() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-
-        // Close write half so remote process receives EOF
-        let _ = rt.block_on(async {
-            use tokio::io::AsyncWriteExt;
-            stream_w.shutdown().await
-        });
-
-        let _ = rt.block_on(read_handle);
-        let _ = stdout_thread.join();
-
-        Ok(())
+    /// Run `program` with quoted `args`.
+    pub fn shell<I, S>(&self, program: &str, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let cmd = self.device.shell(program).args(args);
+        runtime().block_on(async move { cmd.await })
     }
 
-    /// Captures a screenshot from `addr` synchronously, returning PNG bytes.
-    pub fn screencap(&self, addr: SocketAddr, key_path: &Path) -> Result<Vec<u8>> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.screencap(addr, Some(&key)))
+    pub fn has_command(&self, cmd: &str) -> bool {
+        runtime().block_on(self.device.has_command(cmd))
     }
 
-    /// Pulls a remote file from `addr` directly into memory.
-    pub fn pull_bytes(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        remote_path: &str,
-    ) -> Result<Vec<u8>> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.pull_bytes(addr, Some(&key), remote_path))
+    pub fn press(&self, key: Key) -> Result<()> {
+        runtime().block_on(self.device.press(key))
     }
 
-    /// Installs an APK on `addr` synchronously from a local file path.
-    pub fn install_apk<P: AsRef<Path>>(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        local_apk_path: P,
-    ) -> Result<()> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.install_apk(addr, Some(&key), local_apk_path))
+    pub fn push_bytes(&self, bytes: &[u8], remote_path: &str) -> Result<u64> {
+        runtime().block_on(self.device.push_bytes(bytes, remote_path))
     }
 
-    /// Installs an APK on `addr` synchronously directly from in-memory bytes.
-    pub fn install_apk_bytes(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-        apk_bytes: &[u8],
-    ) -> Result<()> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.install_apk_bytes(addr, Some(&key), apk_bytes))
+    pub fn pull_bytes(&self, remote_path: &str) -> Result<Vec<u8>> {
+        runtime().block_on(self.device.pull_bytes(remote_path))
     }
 
-    /// Queries detailed device hardware info synchronously.
-    pub fn get_hardware_info(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-    ) -> Result<crate::info::DeviceHardwareInfo> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.get_hardware_info(addr, Some(&key)))
+    pub fn install(&self, apk: impl Into<PathBuf>) -> Result<()> {
+        let req = self.device.install(apk);
+        runtime().block_on(async move { req.await })
     }
 
-    /// Queries the 64-bit unique Android ID synchronously.
-    pub fn get_android_id(
-        &self,
-        addr: SocketAddr,
-        key_path: &Path,
-    ) -> Result<Option<String>> {
-        let key = load_or_create_from_path(key_path)?;
-        get_runtime().block_on(self.pool.get_android_id(addr, Some(&key)))
+    pub fn uninstall(&self, package: &PackageName) -> Result<()> {
+        runtime().block_on(self.device.uninstall(package))
     }
 
-    /// Scans the local network for ADB devices synchronously.
-    pub fn scan(
-        &self,
-        subnet: Option<&str>,
-        ports: Option<&[u16]>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<Vec<crate::scan::DiscoveredDevice>> {
-        let options = crate::scan::ScanOptions {
-            subnet: subnet.map(|s| s.to_string()),
-            candidates: None,
-            ports: ports
-                .map(|p| p.to_vec())
-                .unwrap_or_else(|| crate::scan::DEFAULT_ADB_PORTS.to_vec()),
-            timeout: timeout.unwrap_or(std::time::Duration::from_millis(800)),
-            concurrency: 96,
-            mdns: true,
-        };
-        get_runtime().block_on(crate::scan::scan_devices(options))
+    pub fn screencap(&self) -> Result<Vec<u8>> {
+        runtime().block_on(self.device.screencap())
+    }
+
+    pub fn hardware_info(&self) -> Result<DeviceHardwareInfo> {
+        runtime().block_on(self.device.hardware_info())
+    }
+
+    pub fn close(&self) {
+        runtime().block_on(self.device.close())
     }
 }

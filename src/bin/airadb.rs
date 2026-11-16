@@ -1,12 +1,16 @@
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process;
+use std::time::Duration;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{self, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
-use airadb::crypto::{default_key_path, load_or_generate_default_key, AdbKeyPair};
-use airadb::device::RebootMode;
-use airadb::AdbDevice;
+use airadb::{
+    ActivityName, Authorization, Client, Device, Error, ErrorKind, Key, KeyPair, PackageName, RebootMode, Result,
+    Subnet,
+};
 
 #[derive(Parser)]
 #[command(name = "airadb", author, version, about = "Pure Rust ADB client for TCP connections (Android 5+)", long_about = None)]
@@ -15,7 +19,7 @@ struct Cli {
     #[arg(short = 's', long = "server", default_value = "127.0.0.1:5555")]
     server: String,
 
-    /// Path to custom ADB private key
+    /// ADB private key (default ~/.android/adbkey, created if missing)
     #[arg(short = 'k', long = "key")]
     key: Option<PathBuf>,
 
@@ -29,8 +33,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Test connection and authenticate with device
+    /// Connect, asking the device to authorize this key if needed
     Connect,
+
+    /// Press remote keys in order (home, back, up, down, left, right, enter, menu, power, volumeup, volumedown)
+    Press {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
 
     /// Query comprehensive device hardware info (CPU, RAM, storage, Android version, Android ID)
     Info,
@@ -189,9 +199,13 @@ enum Commands {
         #[arg(long = "no-mdns")]
         no_mdns: bool,
 
-        /// Per-probe timeout in milliseconds (default: 800)
+        /// Per-probe timeout in milliseconds
         #[arg(short = 't', long = "timeout", default_value = "800")]
         timeout_ms: u64,
+
+        /// Overall time limit in milliseconds
+        #[arg(long = "wait", default_value = "3000")]
+        wait_ms: u64,
     },
 }
 
@@ -274,514 +288,249 @@ impl From<CliRebootMode> for RebootMode {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let filter = if cli.verbose { EnvFilter::new("debug,airadb=trace") } else { EnvFilter::new("warn,airadb=info") };
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
 
-    let filter = if cli.verbose {
-        EnvFilter::new("debug,airadb=trace")
-    } else {
-        EnvFilter::new("warn,airadb=info")
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
-
-    // Handle keygen standalone without connecting
-    if let Commands::Keygen { out } = cli.command {
-        let key_path = out
-            .or_else(default_key_path)
-            .unwrap_or_else(|| PathBuf::from("adbkey"));
-        println!("Generating 2048-bit RSA key pair at: {}", key_path.display());
-        match AdbKeyPair::generate() {
-            Ok(key) => {
-                if let Err(e) = key.save_to_file(&key_path) {
-                    eprintln!("Error saving private key: {}", e);
-                    process::exit(1);
-                }
-                let pub_path = key_path.with_extension("pub");
-                match key.android_pubkey_string("airadb@client") {
-                    Ok(pub_str) => {
-                        let _ = std::fs::write(
-                            &pub_path,
-                            pub_str.trim_end_matches('\0'),
-                        );
-                        println!("Saved public key to: {}", pub_path.display());
-                    }
-                    Err(e) => {
-                        eprintln!("Error creating public key: {}", e);
-                    }
-                }
-                println!("Keypair generated successfully.");
-            }
-            Err(e) => {
-                eprintln!("Key generation failed: {}", e);
-                process::exit(1);
-            }
+    if let Err(e) = run(cli).await {
+        eprintln!("error: {}", e.message());
+        if e.kind() == ErrorKind::Unauthorized {
+            eprintln!("hint: run `airadb -s <addr> connect` and accept the prompt on the device");
         }
-        return;
+        process::exit(1);
     }
+}
 
-    // Handle scan standalone without connecting to a specific server
-    if let Commands::Scan {
-        subnet,
-        ports,
-        no_mdns,
-        timeout_ms,
-    } = cli.command
-    {
-        let port_info = ports
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mdns_str = if !no_mdns { " + mDNS" } else { "" };
-        println!("Scanning network for ADB devices (ports: {}{})...", port_info, mdns_str);
+fn default_key_path() -> PathBuf {
+    dirs::home_dir().map(|h| h.join(".android").join("adbkey")).unwrap_or_else(|| PathBuf::from("adbkey"))
+}
 
-        let options = airadb::ScanOptions {
-            subnet,
-            candidates: None,
-            ports,
-            timeout: std::time::Duration::from_millis(timeout_ms),
-            concurrency: 96,
-            mdns: !no_mdns,
-        };
+fn parse_addr(s: &str) -> Result<SocketAddr> {
+    let with_port = if s.contains(':') { s.to_string() } else { format!("{s}:{}", airadb::DEFAULT_ADB_PORT) };
+    with_port
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidArg, format!("invalid device address '{s}'")))
+}
 
-        match airadb::scan_devices(options).await {
-            Ok(devices) => {
-                if devices.is_empty() {
-                    println!("No ADB devices discovered.");
-                } else {
-                    println!("\nDiscovered {} ADB device(s):", devices.len());
-                    for d in devices {
-                        let auth_str = if d.authorized {
-                            "authorized"
-                        } else {
-                            "unauthorized / needs auth"
-                        };
-                        let model_str = d.model.as_deref().unwrap_or("unknown");
-                        println!("  - {:21} [{:16}] ({})", d.addr, model_str, auth_str);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Scan error: {}", e);
-                process::exit(1);
-            }
-        }
-        return;
+fn package(s: &str) -> Result<PackageName> {
+    s.parse()
+}
+
+/// Connect; when the device does not know the key, ask on screen and wait
+/// (a person is at the terminal, so the dialog is expected).
+async fn ensure_authorized(device: &Device) -> Result<()> {
+    match device.connect().await {
+        Err(e) if e.kind() == ErrorKind::Unauthorized => {}
+        other => return other,
     }
-
-    // Load key
-    let key = match cli.key {
-        Some(p) => match AdbKeyPair::from_file(&p) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("Failed to load key from {}: {}", p.display(), e);
-                process::exit(1);
-            }
-        },
-        None => match load_or_generate_default_key() {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("Warning: failed to load or create default key: {}", e);
-                None
-            }
-        },
-    };
-
-    let device = match if let Some(ref k) = key {
-        AdbDevice::connect_with_key(&cli.server, k).await
-    } else {
-        AdbDevice::connect(&cli.server).await
-    } {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to connect to device at {}: {}", cli.server, e);
-            process::exit(1);
-        }
-    };
-
-    match cli.command {
-        Commands::Keygen { .. } | Commands::Scan { .. } => unreachable!(),
-        Commands::Connect => {
-            println!("Connected successfully to {}", cli.server);
-            println!("Device banner: {}", device.banner().trim());
-            if let Ok(model) = device.get_model().await {
-                println!("Model:         {}", model);
-            }
-            if let Ok(Some(aid)) = device.get_android_id().await {
-                println!("Android ID:    {}", aid);
-            }
-            if let Ok(version) = device.get_android_version().await {
-                println!("Android OS:    {}", version);
-            }
-            if let Ok(sdk) = device.get_sdk_version().await {
-                println!("SDK API:       {}", sdk);
-            }
-            println!("Max payload:   {} bytes", device.max_payload());
-        }
-        Commands::Info => {
-            match device.get_hardware_info().await {
-                Ok(info) => println!("{}", info),
-                Err(e) => {
-                    eprintln!("Failed to get device hardware info: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::GetId => {
-            match device.get_android_id().await {
-                Ok(Some(id)) => println!("{}", id),
-                Ok(None) => {
-                    eprintln!("Android ID not available on device");
-                    process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Failed to get Android ID: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Getprop { key } => {
-            let cmd = match key {
-                Some(k) => format!("getprop {}", k),
-                None => "getprop".to_string(),
-            };
-            match device.shell(&cmd).await {
-                Ok(out) => print!("{}", out),
-                Err(e) => {
-                    eprintln!("Failed to getprop: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Shell { command } => {
-            if command.is_empty() {
-                // Interactive shell
-                match device.interactive_shell().await {
-                    Ok(stream) => {
-                        let mut stdin = io::stdin();
-                        let mut stdout = io::stdout();
-                        let (mut stream_r, mut stream_w) = io::split(stream);
-
-                        tokio::select! {
-                            _ = io::copy(&mut stdin, &mut stream_w) => {}
-                            _ = io::copy(&mut stream_r, &mut stdout) => {}
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to start interactive shell: {}", e);
-                        process::exit(1);
-                    }
-                }
-            } else {
-                let cmd_str = command.join(" ");
-                match device.shell(&cmd_str).await {
-                    Ok(out) => print!("{}", out),
-                    Err(e) => {
-                        eprintln!("Shell command failed: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-        }
-        Commands::Exec { command } => {
-            let cmd_str = command.join(" ");
-            match device.exec(&cmd_str).await {
-                Ok(bytes) => {
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&bytes).await;
-                }
-                Err(e) => {
-                    eprintln!("Exec command failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Push { local, remote } => {
-            if !local.exists() {
-                eprintln!("Local file does not exist: {}", local.display());
-                process::exit(1);
-            }
-            println!("Pushing {} -> {}...", local.display(), remote);
-            match device.push_file(&local, &remote).await {
-                Ok(bytes) => println!("Transferred {} bytes successfully.", bytes),
-                Err(e) => {
-                    eprintln!("Push failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Pull { remote, local } => {
-            let dest_path = local.unwrap_or_else(|| {
-                let filename = remote.rsplit('/').next().unwrap_or("file");
-                PathBuf::from(filename)
-            });
-            println!("Pulling {} -> {}...", remote, dest_path.display());
-            match device.pull_file(&remote, &dest_path).await {
-                Ok(bytes) => println!("Received {} bytes successfully.", bytes),
-                Err(e) => {
-                    eprintln!("Pull failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Screencap { out } => {
-            println!("Capturing screenshot from {}...", cli.server);
-            match device.screencap().await {
-                Ok(png_bytes) => {
-                    if let Err(e) = tokio::fs::write(&out, &png_bytes).await {
-                        eprintln!("Failed to write screenshot to {}: {}", out.display(), e);
-                        process::exit(1);
-                    }
-                    println!(
-                        "Saved screenshot ({} bytes) to {}",
-                        png_bytes.len(),
-                        out.display()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Screenshot failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Stat { remote } => {
-            match device.stat(&remote).await {
-                Ok(st) => {
-                    if st.exists() {
-                        println!("Path:  {}", remote);
-                        println!("Mode:  {:#o}", st.mode);
-                        println!("Size:  {} bytes", st.size);
-                        println!("Mtime: {}", st.mtime);
-                    } else {
-                        println!("File does not exist: {}", remote);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Stat failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Ls { remote } => {
-            match device.list(&remote).await {
-                Ok(entries) => {
-                    println!("{:<10} {:>10} {:>10} NAME", "MODE", "SIZE", "MTIME");
-                    println!("{:-<50}", "");
-                    for ent in entries {
-                        let type_char = if ent.is_dir() { 'd' } else { '-' };
-                        println!(
-                            "{}{:04o}     {:>10} {:>10} {}",
-                            type_char,
-                            ent.mode & 0o777,
-                            ent.size,
-                            ent.mtime,
-                            ent.name
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("List failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Install { apk } => {
-            if !apk.exists() {
-                eprintln!("APK file does not exist: {}", apk.display());
-                process::exit(1);
-            }
-            println!("Installing APK {}...", apk.display());
-            match device.install_apk(&apk).await {
-                Ok(()) => println!("Success"),
-                Err(e) => {
-                    eprintln!("Install failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Uninstall { package, keep_data } => {
-            println!("Uninstalling {} (keep_data: {})...", package, keep_data);
-            match device.uninstall_package(&package, keep_data).await {
-                Ok(()) => println!("Success"),
-                Err(e) => {
-                    eprintln!("Uninstall failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Apps { third_party, filter } => {
-            handle_pm_list(&device, third_party, false, filter.as_deref()).await;
-        }
-        Commands::Start { package, activity } => {
-            println!("Starting {}...", package);
-            match device.start_app(&package, activity.as_deref()).await {
-                Ok(()) => println!("Success: application started"),
-                Err(e) => {
-                    eprintln!("Start failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Stop { package } => {
-            println!("Stopping {}...", package);
-            match device.stop_app(&package).await {
-                Ok(()) => println!("Success: application stopped"),
-                Err(e) => {
-                    eprintln!("Stop failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Pm { subcommand } => match subcommand {
-            PmCommands::List { third_party, system, filter } => {
-                handle_pm_list(&device, third_party, system, filter.as_deref()).await;
-            }
-            PmCommands::Current => {
-                match device.current_app().await {
-                    Ok(Some(app)) => println!("Foreground Application: {}", app),
-                    Ok(None) => println!("No active foreground application detected"),
-                    Err(e) => {
-                        eprintln!("Failed to get current app: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            PmCommands::Start { package, activity } => {
-                println!("Starting {}...", package);
-                match device.start_app(&package, activity.as_deref()).await {
-                    Ok(()) => println!("Success: application started"),
-                    Err(e) => {
-                        eprintln!("Start failed: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            PmCommands::Stop { package } => {
-                println!("Stopping {}...", package);
-                match device.stop_app(&package).await {
-                    Ok(()) => println!("Success: application stopped"),
-                    Err(e) => {
-                        eprintln!("Stop failed: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            PmCommands::Uninstall { package, keep_data } => {
-                println!("Uninstalling {} (keep_data: {})...", package, keep_data);
-                match device.uninstall_package(&package, keep_data).await {
-                    Ok(()) => println!("Success"),
-                    Err(e) => {
-                        eprintln!("Uninstall failed: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-            PmCommands::Clear { package } => {
-                println!("Clearing data for {}...", package);
-                match device.clear_app_data(&package).await {
-                    Ok(()) => println!("Success: app data cleared"),
-                    Err(e) => {
-                        eprintln!("Clear failed: {}", e);
-                        process::exit(1);
-                    }
-                }
-            }
-        },
-        Commands::Reboot { mode } => {
-            let m: RebootMode = mode.into();
-            println!("Rebooting device ({:?})...", m);
-            if let Err(e) = device.reboot(m).await {
-                eprintln!("Reboot request failed: {}", e);
-                process::exit(1);
-            }
-            println!("Reboot command sent.");
-        }
-        Commands::Remount => {
-            println!("Remounting...");
-            match device.remount().await {
-                Ok(out) => print!("{}", out),
-                Err(e) => {
-                    eprintln!("Remount failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Tcpip { port } => {
-            println!("Restarting adbd on port {}...", port);
-            match device.tcpip(port).await {
-                Ok(out) => print!("{}", out),
-                Err(e) => {
-                    eprintln!("Tcpip request failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Root => {
-            println!("Restarting adbd with root permissions...");
-            match device.root().await {
-                Ok(out) => print!("{}", out),
-                Err(e) => {
-                    eprintln!("Root command failed: {}", e);
-                    process::exit(1);
-                }
-            }
-        }
-        Commands::Unroot => {
-            println!("Restarting adbd without root permissions...");
-            match device.unroot().await {
-                Ok(out) => print!("{}", out),
-                Err(e) => {
-                    eprintln!("Unroot command failed: {}", e);
-                    process::exit(1);
-                }
-            }
+    match device.authorize().await? {
+        Authorization::Authorized => Ok(()),
+        Authorization::Waiting(prompt) => {
+            eprintln!("Accept \"Allow USB debugging?\" on the device (waiting up to 30s)...");
+            prompt.wait().await
         }
     }
 }
 
-async fn handle_pm_list(
-    device: &AdbDevice,
-    third_party: bool,
-    system: bool,
-    filter: Option<&str>,
-) {
-    let tp_only = third_party && !system;
-    match device.list_packages(filter, tp_only).await {
-        Ok(mut pkgs) => {
-            if system && !third_party {
-                pkgs.retain(|p| p.is_system);
-            }
-            let label = if third_party && !system {
-                "Third-party (User)"
-            } else if system && !third_party {
-                "System"
-            } else {
-                "Installed"
-            };
-            println!("📱 {} Packages ({} total):\n", label, pkgs.len());
-            if pkgs.is_empty() {
-                println!("  (No packages matching criteria)");
-                return;
-            }
+async fn run(cli: Cli) -> Result<()> {
+    let key_path = cli.key.clone().unwrap_or_else(default_key_path);
 
-            println!("┌─────┬────────────────────────────────────────────────────────┬─────────┐");
-            println!("│ {:<3} │ {:<54} │ {:<7} │", "#", "Package Name", "Type");
-            println!("├─────┼────────────────────────────────────────────────────────┼─────────┤");
-            for (i, p) in pkgs.iter().enumerate() {
-                let p_type = if p.is_system { "System" } else { "User" };
-                let display_name = if p.package_name.len() > 54 {
-                    &p.package_name[..54]
-                } else {
-                    &p.package_name
-                };
-                println!("│ {:<3} │ {:<54} │ {:<7} │", i + 1, display_name, p_type);
-            }
-            println!("└─────┴────────────────────────────────────────────────────────┴─────────┘");
+    if let Commands::Keygen { out } = &cli.command {
+        let path = out.clone().unwrap_or_else(default_key_path);
+        if path.exists() {
+            return Err(Error::new(ErrorKind::InvalidArg, format!("{} already exists", path.display())));
         }
-        Err(e) => {
-            eprintln!("Failed to list packages: {}", e);
-            process::exit(1);
-        }
+        KeyPair::load_or_create(&path)?;
+        println!("Created {} and {}", path.display(), path.with_extension("pub").display());
+        return Ok(());
     }
+
+    let client = Client::new(KeyPair::load_or_create(&key_path)?);
+
+    if let Commands::Scan { subnet, ports, no_mdns, timeout_ms, wait_ms } = &cli.command {
+        let mut discover = client
+            .discover()
+            .ports(ports.iter().copied())
+            .mdns(!no_mdns)
+            .probe_timeout(Duration::from_millis(*timeout_ms))
+            .timeout(Duration::from_millis(*wait_ms));
+        if let Some(s) = subnet {
+            discover = discover.subnet(s.parse::<Subnet>()?);
+        }
+        let ports_str = ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+        println!("Scanning for ADB devices (ports {ports_str}{})...", if *no_mdns { "" } else { " + mDNS" });
+        let found = discover.await?;
+        if found.is_empty() {
+            println!("No ADB devices discovered.");
+        } else {
+            println!("\nDiscovered {} ADB device(s):", found.len());
+            for d in found {
+                let auth = if d.auth_required { "auth required" } else { "open" };
+                println!("  - {:21} [{:16}] ({auth})", d.addr, d.model.as_deref().unwrap_or("unknown"));
+            }
+        }
+        return Ok(());
+    }
+
+    let device = client.device(parse_addr(&cli.server)?);
+    ensure_authorized(&device).await?;
+
+    match cli.command {
+        Commands::Keygen { .. } | Commands::Scan { .. } => unreachable!(),
+        Commands::Connect => {
+            println!("Connected to {}", device.addr());
+            println!("Device banner: {}", device.banner().await?.trim());
+            if let Ok(model) = device.getprop("ro.product.model").await {
+                println!("Model:         {model}");
+            }
+            if let Ok(Some(aid)) = device.android_id().await {
+                println!("Android ID:    {aid}");
+            }
+            if let Ok(v) = device.getprop("ro.build.version.release").await {
+                println!("Android OS:    {v}");
+            }
+            if let Ok(sdk) = device.getprop("ro.build.version.sdk").await {
+                println!("SDK API:       {sdk}");
+            }
+            println!("Max payload:   {} bytes", device.connection().await?.max_payload());
+        }
+        Commands::Press { keys } => {
+            let keys = keys.iter().map(|k| k.parse::<Key>()).collect::<Result<Vec<_>>>()?;
+            device.press_seq(keys).await?;
+        }
+        Commands::Info => println!("{}", device.hardware_info().await?),
+        Commands::GetId => match device.android_id().await? {
+            Some(id) => println!("{id}"),
+            None => return Err(Error::new(ErrorKind::Rejected, "Android ID not available on device")),
+        },
+        Commands::Getprop { key } => match key {
+            Some(k) => println!("{}", device.getprop(&k).await?),
+            None => print!("{}", device.shell("getprop").await?),
+        },
+        Commands::Shell { command } => {
+            if command.is_empty() {
+                let stream = device.interactive_shell().await?;
+                let (mut stream_r, mut stream_w) = io::split(stream);
+                let (mut stdin, mut stdout) = (io::stdin(), io::stdout());
+                tokio::select! {
+                    _ = io::copy(&mut stdin, &mut stream_w) => {}
+                    _ = io::copy(&mut stream_r, &mut stdout) => {}
+                }
+            } else {
+                // Like `adb shell`: the words form one command line.
+                print!("{}", device.shell_raw(&command.join(" ")).await?);
+            }
+        }
+        Commands::Exec { command } => {
+            let bytes = device.exec_raw(&command.join(" ")).await?;
+            io::stdout().write_all(&bytes).await?;
+        }
+        Commands::Push { local, remote } => {
+            println!("Pushing {} -> {remote}...", local.display());
+            println!("Transferred {} bytes.", device.push_file(&local, &remote).await?);
+        }
+        Commands::Pull { remote, local } => {
+            let dest = local.unwrap_or_else(|| PathBuf::from(remote.rsplit('/').next().unwrap_or("file")));
+            println!("Pulling {remote} -> {}...", dest.display());
+            println!("Received {} bytes.", device.pull_file(&remote, &dest).await?);
+        }
+        Commands::Screencap { out } => {
+            let png = device.screencap().await?;
+            tokio::fs::write(&out, &png).await?;
+            println!("Saved screenshot ({} bytes) to {}", png.len(), out.display());
+        }
+        Commands::Stat { remote } => {
+            let st = device.stat(&remote).await?;
+            if st.exists() {
+                println!("Path:  {remote}\nMode:  {:#o}\nSize:  {} bytes\nMtime: {}", st.mode, st.size, st.mtime);
+            } else {
+                println!("File does not exist: {remote}");
+            }
+        }
+        Commands::Ls { remote } => {
+            println!("{:<10} {:>10} {:>10} NAME", "MODE", "SIZE", "MTIME");
+            println!("{:-<50}", "");
+            for ent in device.list(&remote).await? {
+                let t = if ent.is_dir() { 'd' } else { '-' };
+                println!("{t}{:04o}     {:>10} {:>10} {}", ent.mode & 0o777, ent.size, ent.mtime, ent.name);
+            }
+        }
+        Commands::Install { apk } => {
+            println!("Installing {}...", apk.display());
+            let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            device
+                .install(&apk)
+                .on_progress(move |sent, total| {
+                    let pct = (sent * 100).checked_div(total).unwrap_or(100);
+                    if last.swap(pct, std::sync::atomic::Ordering::Relaxed) != pct {
+                        eprint!("\r  upload {pct:3}%");
+                    }
+                })
+                .await?;
+            eprintln!();
+            println!("Success");
+        }
+        Commands::Uninstall { package: pkg, keep_data } | Commands::Pm { subcommand: PmCommands::Uninstall { package: pkg, keep_data } } => {
+            let pkg = package(&pkg)?;
+            if keep_data { device.uninstall_keep_data(&pkg).await? } else { device.uninstall(&pkg).await? }
+            println!("Success");
+        }
+        Commands::Apps { third_party, filter } => list_apps(&device, third_party, false, filter.as_deref()).await?,
+        Commands::Start { package: pkg, activity } | Commands::Pm { subcommand: PmCommands::Start { package: pkg, activity } } => {
+            let pkg = package(&pkg)?;
+            match activity {
+                Some(a) => device.launch_activity(&pkg, &a.parse::<ActivityName>()?).await?,
+                None => device.launch(&pkg).await?,
+            }
+            println!("Started {pkg}");
+        }
+        Commands::Stop { package: pkg } | Commands::Pm { subcommand: PmCommands::Stop { package: pkg } } => {
+            device.force_stop(&package(&pkg)?).await?;
+            println!("Stopped {pkg}");
+        }
+        Commands::Pm { subcommand } => match subcommand {
+            PmCommands::List { third_party, system, filter } => {
+                list_apps(&device, third_party, system, filter.as_deref()).await?
+            }
+            PmCommands::Current => match device.foreground().await? {
+                Some(fg) => println!("Foreground: {}", fg.activity.unwrap_or(fg.package)),
+                None => println!("No foreground application detected"),
+            },
+            PmCommands::Clear { package: pkg } => {
+                device.clear_data(&package(&pkg)?).await?;
+                println!("Cleared data for {pkg}");
+            }
+            PmCommands::Start { .. } | PmCommands::Stop { .. } | PmCommands::Uninstall { .. } => unreachable!(),
+        },
+        Commands::Reboot { mode } => {
+            device.reboot(mode.into()).await?;
+            println!("Reboot command sent.");
+        }
+        Commands::Remount => print!("{}", device.remount().await?),
+        Commands::Tcpip { port } => print!("{}", device.tcpip(port).await?),
+        Commands::Root => print!("{}", device.root().await?),
+        Commands::Unroot => print!("{}", device.unroot().await?),
+    }
+    Ok(())
+}
+
+async fn list_apps(device: &Device, third_party: bool, system: bool, filter: Option<&str>) -> Result<()> {
+    let mut pkgs = if third_party && !system { device.user_apps().await? } else { device.apps().await? };
+    if system && !third_party {
+        pkgs.retain(|p| p.system);
+    }
+    if let Some(f) = filter {
+        pkgs.retain(|p| p.package.contains(f));
+    }
+    let label = match (third_party, system) {
+        (true, false) => "Third-party (User)",
+        (false, true) => "System",
+        _ => "Installed",
+    };
+    println!("{label} packages ({} total):\n", pkgs.len());
+    for (i, p) in pkgs.iter().enumerate() {
+        println!("{:>4}  {:<60} {}", i + 1, p.package, if p.system { "system" } else { "user" });
+    }
+    Ok(())
 }

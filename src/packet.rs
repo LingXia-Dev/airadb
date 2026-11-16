@@ -2,9 +2,11 @@ use std::fmt;
 use byteorder::{ByteOrder, LittleEndian};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::error::{AdbError, Result};
+use crate::error::{Error, Result};
 
 pub const HEADER_SIZE: usize = 24;
+/// Largest packet payload accepted from a device (adbd caps at 1 MiB).
+pub const MAX_PACKET_PAYLOAD: usize = 1024 * 1024;
 
 // ADB Message Commands
 pub const A_SYNC: u32 = 0x434e5953;
@@ -75,7 +77,7 @@ impl AdbMessageHeader {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < HEADER_SIZE {
-            return Err(AdbError::InvalidHeader("Header buffer too small".into()));
+            return Err(Error::protocol("header buffer too small"));
         }
         let command = LittleEndian::read_u32(&bytes[0..4]);
         let arg0 = LittleEndian::read_u32(&bytes[4..8]);
@@ -85,7 +87,7 @@ impl AdbMessageHeader {
         let magic = LittleEndian::read_u32(&bytes[20..24]);
 
         if magic != (command ^ 0xffffffff) {
-            return Err(AdbError::MagicMismatch { command, magic });
+            return Err(Error::protocol(format!("magic mismatch: command {command:#x}, magic {magic:#x}")));
         }
 
         Ok(Self {
@@ -165,33 +167,26 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
     skip_checksum: bool,
 ) -> Result<AdbPacket> {
     let mut header_buf = [0u8; HEADER_SIZE];
-    reader.read_exact(&mut header_buf).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-            AdbError::ConnectionClosed
-        } else {
-            AdbError::Io(e)
-        }
-    })?;
+    reader.read_exact(&mut header_buf).await?;
 
     let header = AdbMessageHeader::from_bytes(&header_buf)?;
 
+    // adbd never sends more than 1 MiB per packet; do not let a peer make
+    // us allocate gigabytes.
+    if header.data_length as usize > MAX_PACKET_PAYLOAD {
+        return Err(Error::protocol(format!("packet payload too large: {} bytes", header.data_length)));
+    }
     let mut payload = vec![0u8; header.data_length as usize];
     if header.data_length > 0 {
-        reader.read_exact(&mut payload).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                AdbError::ConnectionClosed
-            } else {
-                AdbError::Io(e)
-            }
-        })?;
+        reader.read_exact(&mut payload).await?;
 
         if !skip_checksum && header.data_check != 0 {
             let calculated = calculate_checksum(&payload);
             if calculated != header.data_check {
-                return Err(AdbError::ChecksumMismatch {
-                    expected: header.data_check,
-                    calculated,
-                });
+                return Err(Error::protocol(format!(
+                    "checksum mismatch: expected {:#x}, got {calculated:#x}",
+                    header.data_check
+                )));
             }
         }
     }
@@ -238,10 +233,9 @@ mod tests {
         let mut header = AdbMessageHeader::new(A_CNXN, 0x01000000, 4096, 12, 1234);
         header.magic = 0;
         let bytes = header.to_bytes();
-        assert!(matches!(
-            AdbMessageHeader::from_bytes(&bytes),
-            Err(AdbError::MagicMismatch { .. })
-        ));
+        let err = AdbMessageHeader::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Protocol);
+        assert!(err.message().contains("magic"));
     }
 
     #[test]
@@ -279,6 +273,6 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let res = read_packet(&mut cursor, false).await;
-        assert!(matches!(res, Err(AdbError::ChecksumMismatch { .. })));
+        assert!(res.unwrap_err().message().contains("checksum"));
     }
 }

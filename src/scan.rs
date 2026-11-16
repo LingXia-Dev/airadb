@@ -1,12 +1,17 @@
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashSet};
+use std::future::{Future, IntoFuture};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
+use crate::types::Subnet;
 use crate::packet::{read_packet, write_packet, AdbPacket, A_AUTH, A_CNXN, A_VERSION_SKIP_CHECKSUM};
 
 /// Default TCP port for standard ADB daemon.
@@ -30,102 +35,9 @@ pub struct DiscoveredDevice {
     pub device: Option<String>,
     /// Raw banner string returned by the device.
     pub banner: String,
-    /// Whether the device is already authorized or needs key authentication.
-    pub authorized: bool,
-}
-
-/// Options controlling network scanning for ADB devices.
-#[derive(Debug, Clone)]
-pub struct ScanOptions {
-    /// Subnet or IP prefix to scan (e.g. "192.168.1" or "192.168.1.0/24").
-    /// If None, automatically detects the local IPv4 subnet.
-    pub subnet: Option<String>,
-    /// Explicit list of candidate IP addresses to probe. Overrides `subnet` if provided.
-    pub candidates: Option<Vec<Ipv4Addr>>,
-    /// Ports to probe on each candidate IP. Defaults to `[5555, 9527]`.
-    pub ports: Vec<u16>,
-    /// Timeout for each connection and probe attempt. Defaults to 800ms.
-    pub timeout: Duration,
-    /// Maximum concurrent TCP probes to run simultaneously. Defaults to 96.
-    pub concurrency: usize,
-    /// Whether to perform mDNS multicast discovery (`_adb._tcp.local`). Defaults to true.
-    pub mdns: bool,
-}
-
-impl Default for ScanOptions {
-    fn default() -> Self {
-        Self {
-            subnet: None,
-            candidates: None,
-            ports: DEFAULT_ADB_PORTS.to_vec(),
-            timeout: Duration::from_millis(800),
-            concurrency: 96,
-            mdns: true,
-        }
-    }
-}
-
-/// Detects the local host's IPv4 address by querying the routing table via a dummy UDP socket.
-///
-/// This does NOT send any packets on the wire, making it completely non-intrusive
-/// and compatible with iOS, Android, HarmonyOS, macOS, and Linux sandboxes.
-pub fn detect_local_ipv4() -> Option<Ipv4Addr> {
-    // 1. First probe multicast (224.0.0.1:80), which routes to the physical Wi-Fi/LAN interface
-    //    and correctly bypasses point-to-point VPN/TUN tunnels (which don't handle multicast).
-    for probe in &["224.0.0.1:80", "239.255.255.250:80", "8.8.8.8:80"] {
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-            if socket.connect(probe).is_ok() {
-                if let Ok(addr) = socket.local_addr() {
-                    if let IpAddr::V4(ipv4) = addr.ip() {
-                        if !ipv4.is_loopback() && !ipv4.is_unspecified() {
-                            return Some(ipv4);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Parses an IP prefix string (e.g. "192.168.1", "192.168.1.0/24", "192.168.1.5")
-/// and returns the list of 254 candidate host IPs (1..=254) or a single IP.
-pub fn parse_subnet_candidates(prefix_or_cidr: &str) -> Option<Vec<Ipv4Addr>> {
-    let trimmed = prefix_or_cidr.trim().trim_end_matches('/');
-    // Check if it's a CIDR like "192.168.1.0/24"
-    let base = if let Some((cidr_ip, mask)) = trimmed.split_once('/') {
-        if mask != "24" {
-            // For now, support /24 subnets which are standard in home/office Wi-Fi
-            return None;
-        }
-        cidr_ip
-    } else {
-        trimmed
-    };
-
-    let parts: Vec<&str> = base.split('.').collect();
-    match parts.len() {
-        3 => {
-            let a: u8 = parts[0].parse().ok()?;
-            let b: u8 = parts[1].parse().ok()?;
-            let c: u8 = parts[2].parse().ok()?;
-            Some((1..=254).map(|d| Ipv4Addr::new(a, b, c, d)).collect())
-        }
-        4 => {
-            let a: u8 = parts[0].parse().ok()?;
-            let b: u8 = parts[1].parse().ok()?;
-            let c: u8 = parts[2].parse().ok()?;
-            let d: u8 = parts[3].parse().ok()?;
-            if d == 0 {
-                // e.g. "192.168.1.0"
-                Some((1..=254).map(|host| Ipv4Addr::new(a, b, c, host)).collect())
-            } else {
-                // Exact single IP
-                Some(vec![Ipv4Addr::new(a, b, c, d)])
-            }
-        }
-        _ => None,
-    }
+    /// The device answered with an auth challenge (it may still trust our
+    /// key); `false` means it accepted the connection without one.
+    pub auth_required: bool,
 }
 
 /// Helper to parse ADB banner properties such as `ro.product.model=...`.
@@ -155,7 +67,7 @@ fn parse_banner_props(banner: &str) -> (Option<String>, Option<String>, Option<S
 /// to verify whether an actual ADB daemon is listening.
 ///
 /// Returns `Some(DiscoveredDevice)` if the target responds with `A_CNXN` or `A_AUTH`.
-pub async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option<DiscoveredDevice> {
+pub(crate) async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option<DiscoveredDevice> {
     // 1. Establish TCP connection with timeout
     let mut stream = timeout(timeout_dur, TcpStream::connect(addr))
         .await
@@ -192,7 +104,7 @@ pub async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option
             product,
             device,
             banner,
-            authorized: true,
+            auth_required: false,
         })
     } else if response.command == A_AUTH {
         Some(DiscoveredDevice {
@@ -201,7 +113,7 @@ pub async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option
             product: None,
             device: None,
             banner: String::new(),
-            authorized: false,
+            auth_required: true,
         })
     } else {
         None
@@ -264,7 +176,7 @@ fn skip_dns_name(buf: &[u8], mut idx: usize) -> Option<usize> {
 }
 
 /// Parses an mDNS response packet, extracting SRV ports and A record IPv4 addresses.
-pub fn parse_mdns_response(buf: &[u8], peer_ip: Ipv4Addr) -> Vec<SocketAddr> {
+pub(crate) fn parse_mdns_response(buf: &[u8], peer_ip: Ipv4Addr) -> Vec<SocketAddr> {
     if buf.len() < 12 {
         return Vec::new();
     }
@@ -339,148 +251,239 @@ pub fn parse_mdns_response(buf: &[u8], peer_ip: Ipv4Addr) -> Vec<SocketAddr> {
     endpoints
 }
 
-/// Discovers ADB device endpoints on the local network via mDNS multicast (`224.0.0.251:5353`).
-pub async fn discover_mdns_adb_endpoints(timeout_dur: Duration) -> Vec<SocketAddr> {
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let multicast_addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
-    let query_plain = build_mdns_ptr_query("_adb._tcp.local");
-    let query_tls = build_mdns_ptr_query("_adb-tls-connect._tcp.local");
-
-    let _ = socket.send_to(&query_plain, multicast_addr).await;
-    let _ = socket.send_to(&query_tls, multicast_addr).await;
-
-    let mut discovered = HashSet::new();
-    let deadline = tokio::time::Instant::now() + timeout_dur;
-    let mut buf = [0u8; 4096];
-
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, peer_addr))) => {
-                if let IpAddr::V4(ipv4) = peer_addr.ip() {
-                    let endpoints = parse_mdns_response(&buf[..len], ipv4);
-                    for ep in endpoints {
-                        discovered.insert(ep);
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-
-    discovered.into_iter().collect()
+/// Discovery options. `.await` for the full list, or [`start`](Discover::start)
+/// to receive devices as they answer. Probing sends a CNXN and reads the
+/// reply; it never offers a key, so no device shows a dialog.
+#[must_use = "discovery does nothing until awaited or started"]
+pub struct Discover {
+    subnets: BTreeSet<Subnet>,
+    hosts: BTreeSet<Ipv4Addr>,
+    ports: Vec<u16>,
+    duration: Duration,
+    probe_timeout: Duration,
+    concurrency: usize,
+    mdns: bool,
 }
 
-/// Scans the network for active ADB devices according to `options`.
-///
-/// Combines mDNS multicast discovery with concurrent TCP probing bounded by `options.concurrency`
-/// and returns all responsive ADB devices.
-pub async fn scan_devices(options: ScanOptions) -> Result<Vec<DiscoveredDevice>> {
-    let mut candidate_addrs = HashSet::new();
+impl Discover {
+    pub(crate) fn new() -> Self {
+        Self {
+            subnets: BTreeSet::new(),
+            hosts: BTreeSet::new(),
+            ports: DEFAULT_ADB_PORTS.to_vec(),
+            duration: Duration::from_secs(3),
+            probe_timeout: Duration::from_millis(800),
+            concurrency: 96,
+            mdns: true,
+        }
+    }
 
-    // 1. Run mDNS discovery if enabled and candidates is not explicitly constrained
-    if options.mdns && options.candidates.is_none() {
-        let mdns_endpoints = discover_mdns_adb_endpoints(Duration::from_millis(500)).await;
-        for ep in mdns_endpoints {
-            // If subnet is specified, only include endpoints matching that subnet
-            if let Some(ref subnet_str) = options.subnet {
-                if let Some(valid_ips) = parse_subnet_candidates(subnet_str) {
-                    if let IpAddr::V4(ipv4) = ep.ip() {
-                        if !valid_ips.contains(&ipv4) {
-                            continue;
-                        }
-                    }
+    /// Sweep this subnet; may be repeated. Without subnets or hosts, the
+    /// subnet of the default-route interface is swept.
+    pub fn subnet(mut self, subnet: Subnet) -> Self {
+        self.subnets.insert(subnet);
+        self
+    }
+
+    /// Probe exactly these addresses (on every port).
+    pub fn hosts(mut self, hosts: impl IntoIterator<Item = Ipv4Addr>) -> Self {
+        self.hosts.extend(hosts);
+        self
+    }
+
+    /// Ports to probe on each host. Default 5555, 9527, 5566.
+    pub fn ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.ports = ports.into_iter().collect();
+        self
+    }
+
+    /// Upper bound for the whole discovery. Default 3s.
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// Per-address connect + reply timeout. Default 800ms.
+    pub fn probe_timeout(mut self, duration: Duration) -> Self {
+        self.probe_timeout = duration;
+        self
+    }
+
+    /// Probes in flight at once. Default 96.
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n.max(1);
+        self
+    }
+
+    /// Also ask mDNS for `_adb._tcp.local` (default on).
+    pub fn mdns(mut self, enabled: bool) -> Self {
+        self.mdns = enabled;
+        self
+    }
+
+    /// Begin. Fails with [`ErrorKind::NoNetwork`] when nothing was given and
+    /// no local IPv4 interface exists.
+    pub fn start(self) -> Result<Discovery> {
+        if self.ports.is_empty() {
+            return Err(Error::invalid_arg("no ports to probe"));
+        }
+        let mut ips: BTreeSet<Ipv4Addr> = self.hosts;
+        let mut subnets = self.subnets;
+        if ips.is_empty() && subnets.is_empty() {
+            subnets.insert(
+                Subnet::detect()
+                    .ok_or_else(|| Error::new(ErrorKind::NoNetwork, "no local IPv4 network to discover on"))?,
+            );
+        }
+        for subnet in &subnets {
+            ips.extend(subnet.hosts());
+        }
+        let mdns_socket = if self.mdns {
+            std::net::UdpSocket::bind("0.0.0.0:0")
+                .and_then(|s| {
+                    s.set_nonblocking(true)?;
+                    tokio::net::UdpSocket::from_std(s)
+                })
+                .map_err(|e| tracing::debug!("mDNS unavailable: {e}"))
+                .ok()
+        } else {
+            None
+        };
+
+        let shared = Arc::new(Shared {
+            probe_timeout: self.probe_timeout,
+            seen: Mutex::new(HashSet::new()),
+            limit: Semaphore::new(self.concurrency),
+            subnets,
+            explicit: ips.clone(),
+        });
+        let (tx, rx) = mpsc::channel(64);
+        let mut tasks = JoinSet::new();
+        for ip in ips {
+            for &port in &self.ports {
+                tasks.spawn(probe(shared.clone(), SocketAddr::new(IpAddr::V4(ip), port), tx.clone()));
+            }
+        }
+        if let Some(socket) = mdns_socket {
+            tasks.spawn(mdns_query(shared.clone(), socket, self.duration, tx.clone()));
+        }
+        drop(tx);
+        Ok(Discovery { rx, _tasks: tasks, deadline: Box::pin(tokio::time::sleep(self.duration)), finished: false })
+    }
+}
+
+impl IntoFuture for Discover {
+    type Output = Result<Vec<DiscoveredDevice>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let mut discovery = self.start()?;
+            let mut all = Vec::new();
+            while let Some(d) = discovery.next().await {
+                all.push(d);
+            }
+            all.sort_by_key(|d| d.addr);
+            Ok(all)
+        })
+    }
+}
+
+/// A running discovery. Yields each endpoint once; dropping it stops all probes.
+pub struct Discovery {
+    rx: mpsc::Receiver<DiscoveredDevice>,
+    _tasks: JoinSet<()>,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    finished: bool,
+}
+
+impl Discovery {
+    /// The next device, or `None` when every probe finished or the timeout passed.
+    pub async fn next(&mut self) -> Option<DiscoveredDevice> {
+        std::future::poll_fn(|cx| self.poll_next_device(cx)).await
+    }
+
+    fn poll_next_device(&mut self, cx: &mut Context<'_>) -> Poll<Option<DiscoveredDevice>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(item) = self.rx.poll_recv(cx) {
+            self.finished = item.is_none();
+            return Poll::Ready(item);
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.finished = true;
+            self.rx.close();
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+}
+
+impl futures_core::Stream for Discovery {
+    type Item = DiscoveredDevice;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<DiscoveredDevice>> {
+        self.get_mut().poll_next_device(cx)
+    }
+}
+
+struct Shared {
+    probe_timeout: Duration,
+    seen: Mutex<HashSet<SocketAddr>>,
+    limit: Semaphore,
+    subnets: BTreeSet<Subnet>,
+    explicit: BTreeSet<Ipv4Addr>,
+}
+
+impl Shared {
+    /// mDNS answers from outside what was asked for are ignored.
+    fn wanted(&self, ip: Ipv4Addr) -> bool {
+        self.explicit.contains(&ip) || self.subnets.iter().any(|s| s.contains(ip))
+    }
+}
+
+async fn probe(shared: Arc<Shared>, addr: SocketAddr, tx: mpsc::Sender<DiscoveredDevice>) {
+    let Ok(_permit) = shared.limit.acquire().await else { return };
+    if shared.seen.lock().unwrap().contains(&addr) {
+        return;
+    }
+    let Some(found) = probe_adb_device(addr, shared.probe_timeout).await else { return };
+    if shared.seen.lock().unwrap().insert(addr) {
+        let _ = tx.send(found).await;
+    }
+}
+
+async fn mdns_query(
+    shared: Arc<Shared>,
+    socket: tokio::net::UdpSocket,
+    duration: Duration,
+    tx: mpsc::Sender<DiscoveredDevice>,
+) {
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
+    if let Err(e) = socket.send_to(&build_mdns_ptr_query("_adb._tcp.local"), group).await {
+        tracing::debug!("mDNS query not sent: {e}");
+        return;
+    }
+    let mut probes = JoinSet::new();
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + duration;
+    while let Ok(Ok((len, peer))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
+        let IpAddr::V4(peer_ip) = peer.ip() else { continue };
+        for endpoint in parse_mdns_response(&buf[..len], peer_ip) {
+            if let IpAddr::V4(ip) = endpoint.ip() {
+                if shared.wanted(ip) {
+                    probes.spawn(probe(shared.clone(), endpoint, tx.clone()));
                 }
             }
-            candidate_addrs.insert(ep);
         }
     }
-
-    // 2. Add candidates from subnet / IP candidate list
-    let candidate_ips = if let Some(candidates) = options.candidates {
-        candidates
-    } else if let Some(ref subnet_str) = options.subnet {
-        parse_subnet_candidates(subnet_str).unwrap_or_default()
-    } else if let Some(local_ip) = detect_local_ipv4() {
-        let octets = local_ip.octets();
-        (1..=254)
-            .map(|host| Ipv4Addr::new(octets[0], octets[1], octets[2], host))
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let ports = if options.ports.is_empty() {
-        DEFAULT_ADB_PORTS.to_vec()
-    } else {
-        options.ports
-    };
-
-    for ip in candidate_ips {
-        for &port in &ports {
-            candidate_addrs.insert(SocketAddr::new(IpAddr::V4(ip), port));
-        }
-    }
-
-    if candidate_addrs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let semaphore = Arc::new(Semaphore::new(options.concurrency));
-    let mut tasks = Vec::with_capacity(candidate_addrs.len());
-
-    for addr in candidate_addrs {
-        let sem = semaphore.clone();
-        let timeout_dur = options.timeout;
-
-        tasks.push(tokio::spawn(async move {
-            let _permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return None,
-            };
-            probe_adb_device(addr, timeout_dur).await
-        }));
-    }
-
-    let mut discovered = Vec::new();
-    for task in tasks {
-        if let Ok(Some(device)) = task.await {
-            discovered.push(device);
-        }
-    }
-
-    // Sort by IP address and port for deterministic output
-    discovered.sort_by_key(|d| d.addr);
-    Ok(discovered)
+    while probes.join_next().await.is_some() {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_subnet_candidates() {
-        let ips = parse_subnet_candidates("192.168.1").unwrap();
-        assert_eq!(ips.len(), 254);
-        assert_eq!(ips[0], Ipv4Addr::new(192, 168, 1, 1));
-        assert_eq!(ips[253], Ipv4Addr::new(192, 168, 1, 254));
-
-        let ips2 = parse_subnet_candidates("192.168.2.0/24").unwrap();
-        assert_eq!(ips2.len(), 254);
-        assert_eq!(ips2[0], Ipv4Addr::new(192, 168, 2, 1));
-
-        let single = parse_subnet_candidates("10.0.0.15").unwrap();
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0], Ipv4Addr::new(10, 0, 0, 15));
-    }
 
     #[test]
     fn test_parse_banner_props() {

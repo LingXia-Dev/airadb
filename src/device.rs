@@ -1,33 +1,22 @@
 use std::fmt;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::ToSocketAddrs;
+use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::timeout;
 
-use crate::connection::AdbConnection;
-use crate::crypto::AdbKeyPair;
-use crate::error::{AdbError, Result};
+use crate::client::Client;
+use crate::connection::{hello, AdbConnection, AwaitingUser, Hello};
+use crate::error::{Error, ErrorKind, Result};
 use crate::stream::AdbStream;
 use crate::sync::{AdbSync, SyncDent, SyncStat, DEFAULT_FILE_MODE};
-
-/// Output of an ADB shell command, providing stdout and stderr buffers.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ShellOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
-impl ShellOutput {
-    pub fn stdout_string_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).to_string()
-    }
-
-    pub fn stderr_string_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.stderr).to_string()
-    }
-}
+use crate::types::{ActivityName, Key, PackageName};
 
 /// Reboot target modes for ADB device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,400 +33,523 @@ pub enum RebootMode {
 
 impl fmt::Display for RebootMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::System => write!(f, ""),
-            Self::Bootloader => write!(f, "bootloader"),
-            Self::Recovery => write!(f, "recovery"),
-            Self::Sideload => write!(f, "sideload"),
-        }
+        f.write_str(match self {
+            Self::System => "",
+            Self::Bootloader => "bootloader",
+            Self::Recovery => "recovery",
+            Self::Sideload => "sideload",
+        })
     }
 }
 
-/// Pads command with a trailing space if missing.
-///
-/// Workaround for older Android adbd transports (specifically on Android 5)
-/// that sometimes drop the last byte of a command payload.
-fn format_padded_cmd(prefix: &str, command: &str) -> String {
-    let trimmed = command.trim_end_matches('\0');
-    if !trimmed.ends_with(char::is_whitespace) {
-        format!("{}{} \0", prefix, trimmed)
-    } else {
-        format!("{}{}\0", prefix, trimmed)
-    }
-}
-
-/// High-level client interface representing a connected Android device.
-///
-/// An `AdbDevice` maintains a persistent TCP connection to `adbd`, multiplexing
-/// multiple commands and file transfers over that single connection without reconnecting.
-#[derive(Clone)]
-pub struct AdbDevice {
-    connection: Arc<AdbConnection>,
-}
-
-/// Information about an installed application package on Android.
+/// An installed package.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledPackage {
-    pub package_name: String,
+pub struct Package {
+    /// The package name as the device reports it.
+    pub package: String,
     pub apk_path: Option<String>,
-    pub is_system: bool,
+    pub system: bool,
 }
 
-impl AdbDevice {
-    /// Connects to an ADB device at `addr` using default or auto-generated keys.
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        let conn = AdbConnection::connect(addr, None).await?;
-        Ok(Self {
-            connection: Arc::new(conn),
-        })
+/// The focused app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Foreground {
+    pub package: String,
+    /// Fully qualified activity class, when the device reports one.
+    pub activity: Option<String>,
+}
+
+/// The result of [`Device::authorize`].
+#[must_use]
+pub enum Authorization {
+    /// The device already trusts this client's key.
+    Authorized,
+    /// The device is showing "Allow USB debugging?". Wait for the user.
+    Waiting(AuthPrompt),
+}
+
+impl fmt::Debug for Authorization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorized => f.write_str("Authorized"),
+            Self::Waiting(_) => f.write_str("Waiting(..)"),
+        }
+    }
+}
+
+/// The device is showing its authorization dialog for our key.
+pub struct AuthPrompt {
+    device: Device,
+    awaiting: AwaitingUser,
+}
+
+impl AuthPrompt {
+    /// Wait up to the client's auth timeout (default 30s) for the user to
+    /// allow. Declining and ignoring the dialog both end in
+    /// [`ErrorKind::Unauthorized`]; the device does not say which.
+    pub async fn wait(self) -> Result<()> {
+        let limit = self.device.inner.client.inner.auth_timeout;
+        self.wait_timeout(limit).await
     }
 
-    /// Connects to an ADB device at `addr` using the specified `AdbKeyPair`.
-    pub async fn connect_with_key<A: ToSocketAddrs>(
-        addr: A,
-        key: &AdbKeyPair,
-    ) -> Result<Self> {
-        let conn = AdbConnection::connect(addr, Some(key)).await?;
-        Ok(Self {
-            connection: Arc::new(conn),
-        })
+    pub async fn wait_timeout(self, limit: Duration) -> Result<()> {
+        let conn = self.awaiting.wait(limit).await?;
+        let mut slot = self.device.inner.conn.lock().await;
+        self.device.inner.install(&mut slot, conn);
+        Ok(())
     }
 
-    /// Creates an `AdbDevice` from an existing `AdbConnection`.
-    pub fn from_connection(connection: AdbConnection) -> Self {
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// One Android device reachable over TCP. Cheap to clone; clones (and
+/// other handles for the same address from the same [`Client`]) share the
+/// connection.
+///
+/// Creating it sends nothing. The first call connects, authenticating with
+/// the client's key **without** offering it: a device that does not trust
+/// the key fails fast with [`ErrorKind::Unauthorized`] and shows nothing.
+/// Only [`authorize`](Device::authorize) makes the device ask its user.
+#[derive(Clone)]
+pub struct Device {
+    pub(crate) inner: Arc<DeviceInner>,
+}
+
+pub(crate) struct DeviceInner {
+    client: Client,
+    addr: SocketAddr,
+    conn: tokio::sync::Mutex<Option<Arc<AdbConnection>>>,
+    generation: AtomicU64,
+    last_used: Mutex<Instant>,
+}
+
+impl DeviceInner {
+    pub(crate) fn new(client: Client, addr: SocketAddr) -> Self {
         Self {
-            connection: Arc::new(connection),
+            client,
+            addr,
+            conn: tokio::sync::Mutex::new(None),
+            generation: AtomicU64::new(0),
+            last_used: Mutex::new(Instant::now()),
         }
     }
 
-    /// Returns a reference to the underlying `AdbConnection`.
-    pub fn connection(&self) -> &AdbConnection {
-        &self.connection
+    fn touch(&self) {
+        *self.last_used.lock().unwrap() = Instant::now();
     }
 
-    /// Maximum payload allowed by the connected device.
-    pub fn max_payload(&self) -> usize {
-        self.connection.max_payload()
+    /// Put `conn` in the slot and start its idle reaper.
+    fn install(self: &Arc<Self>, slot: &mut Option<Arc<AdbConnection>>, conn: AdbConnection) -> Arc<AdbConnection> {
+        let conn = Arc::new(conn);
+        *slot = Some(conn.clone());
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.touch();
+        if let Some(idle) = self.client.inner.idle_timeout {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(reap_when_idle(weak, generation, idle));
+        }
+        conn
+    }
+}
+
+async fn reap_when_idle(device: std::sync::Weak<DeviceInner>, generation: u64, idle: Duration) {
+    let tick = (idle / 4).max(Duration::from_millis(50));
+    loop {
+        tokio::time::sleep(tick).await;
+        let Some(device) = device.upgrade() else { return };
+        if device.generation.load(Ordering::SeqCst) != generation {
+            return; // replaced by a newer connection with its own reaper
+        }
+        let mut slot = device.conn.lock().await;
+        let Some(conn) = slot.as_ref() else { return };
+        if !conn.is_connected() {
+            *slot = None;
+            return;
+        }
+        let quiet = device.last_used.lock().unwrap().elapsed() >= idle;
+        if quiet && !conn.has_open_streams() {
+            tracing::debug!("closing idle connection to {}", device.addr);
+            if let Some(conn) = slot.take() {
+                conn.shutdown().await;
+            }
+            return;
+        }
+    }
+}
+
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Device").field("addr", &self.inner.addr).finish()
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
+}
+
+/// Workaround for Android 5 adbd, which can drop the last byte of a
+/// service name: end every command with a space.
+fn padded_service(prefix: &str, command: &str) -> String {
+    let trimmed = command.trim_end_matches('\0');
+    if trimmed.ends_with(char::is_whitespace) {
+        format!("{prefix}{trimmed}\0")
+    } else {
+        format!("{prefix}{trimmed} \0")
+    }
+}
+
+/// Quote one argument for `/system/bin/sh`.
+pub fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-./=:,@%+".contains(&b));
+    if plain {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+impl Device {
+    pub fn addr(&self) -> SocketAddr {
+        self.inner.addr
     }
 
-    /// Device banner string (e.g. `device::ro.product.model=...`).
-    pub fn banner(&self) -> &str {
-        self.connection.device_banner()
+    /// The live connection, connecting first if needed (signature only).
+    pub async fn connection(&self) -> Result<Arc<AdbConnection>> {
+        let mut slot = self.inner.conn.lock().await;
+        if let Some(conn) = slot.as_ref() {
+            if conn.is_connected() {
+                self.inner.touch();
+                return Ok(conn.clone());
+            }
+        }
+        *slot = None;
+        let client = &self.inner.client.inner;
+        match hello(self.inner.addr, &client.key, client.timeouts).await? {
+            Hello::Connected(conn) => Ok(self.inner.install(&mut slot, conn)),
+            Hello::UnknownKey(_) => Err(Error::unauthorized(format!(
+                "{} does not trust this client's key; call authorize() and confirm on the device",
+                self.inner.addr
+            ))),
+        }
     }
 
-    /// Checks if the connection to the device is alive.
-    pub fn is_connected(&self) -> bool {
-        self.connection.is_connected()
+    /// Connect now (signature only). Fails with [`ErrorKind::Unauthorized`]
+    /// if the device does not trust the key; nothing is shown on it.
+    pub async fn connect(&self) -> Result<()> {
+        self.connection().await.map(drop)
     }
 
-    /// Opens an arbitrary multiplexed service stream (e.g. `shell:...`, `sync:`, `exec:...`).
+    /// Connect, offering the public key if the device does not trust it.
+    /// This is the only call that makes the device show its dialog.
+    pub async fn authorize(&self) -> Result<Authorization> {
+        let mut slot = self.inner.conn.lock().await;
+        if slot.as_ref().is_some_and(|c| c.is_connected()) {
+            return Ok(Authorization::Authorized);
+        }
+        let client = &self.inner.client.inner;
+        match hello(self.inner.addr, &client.key, client.timeouts).await? {
+            Hello::Connected(conn) => {
+                self.inner.install(&mut slot, conn);
+                Ok(Authorization::Authorized)
+            }
+            Hello::UnknownKey(pending) => {
+                drop(slot);
+                let awaiting = pending.offer_key(&client.key).await?;
+                Ok(Authorization::Waiting(AuthPrompt { device: self.clone(), awaiting }))
+            }
+        }
+    }
+
+    pub async fn is_connected(&self) -> bool {
+        self.inner.conn.lock().await.as_ref().is_some_and(|c| c.is_connected())
+    }
+
+    /// The banner the device sent on connect (`device::ro.product.model=…`).
+    pub async fn banner(&self) -> Result<String> {
+        Ok(self.connection().await?.device_banner().to_string())
+    }
+
+    /// Close the connection now. The next call reconnects.
+    pub async fn close(&self) {
+        if let Some(conn) = self.inner.conn.lock().await.take() {
+            conn.shutdown().await;
+        }
+    }
+
+    /// Open a raw service stream (`shell:…`, `exec:…`, `sync:`, …).
     pub async fn open_stream(&self, destination: &str) -> Result<AdbStream> {
-        self.connection.open_stream(destination).await
+        let conn = self.connection().await?;
+        self.inner.touch();
+        conn.open_stream(destination).await
     }
 
-    /// Executes a shell command on the device and returns its combined output as a String.
+    // ---------------------------------------------------------------- shell
+
+    /// A shell command. Arguments added with [`ShellCommand::arg`] are
+    /// quoted, so values cannot change what runs.
     ///
-    /// Automatically applies Android 5 command padding safety to prevent last-byte truncation.
-    pub async fn shell(&self, command: &str) -> Result<String> {
-        let dest = format_padded_cmd("shell:", command);
-        let mut stream = self.open_stream(&dest).await?;
-        stream.read_string_lossy().await
+    /// ```no_run
+    /// # async fn demo(dev: airadb::Device) -> airadb::Result<()> {
+    /// let model = dev.shell("getprop").arg("ro.product.model").await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn shell(&self, program: &str) -> ShellCommand {
+        ShellCommand { device: self.clone(), line: shell_quote(program), checked: false }
     }
 
-    /// Executes a shell command and returns raw output bytes.
-    pub async fn shell_bytes(&self, command: &str) -> Result<Vec<u8>> {
-        let dest = format_padded_cmd("shell:", command);
-        let mut stream = self.open_stream(&dest).await?;
+    /// Run a whole command line as is. The caller is responsible for
+    /// quoting; prefer [`shell`](Device::shell).
+    pub async fn shell_raw(&self, command: &str) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.shell_raw_bytes(command).await?).into_owned())
+    }
+
+    pub async fn shell_raw_bytes(&self, command: &str) -> Result<Vec<u8>> {
+        let mut stream = self.open_stream(&padded_service("shell:", command)).await?;
         stream.read_all().await
     }
 
-    /// Executes a shell command and returns `ShellOutput` (stdout + stderr).
-    ///
-    /// Note: On Android < 7 without `shell_v2`, adbd sends combined stdout and stderr
-    /// over the PTY, returned here in `stdout`.
-    pub async fn shell_output(&self, command: &str) -> Result<ShellOutput> {
-        let stdout = self.shell_bytes(command).await?;
-        Ok(ShellOutput {
-            stdout,
-            stderr: Vec::new(),
-        })
-    }
-
-    /// Executes a shell command with a timeout duration.
-    pub async fn shell_timeout(&self, command: &str, duration: Duration) -> Result<String> {
-        timeout(duration, self.shell(command)).await.map_err(|_| {
-            AdbError::Timeout(format!(
-                "Command '{}' timed out after {:?}",
-                command, duration
-            ))
-        })?
-    }
-
-    /// Executes a shell command and validates its exit code.
-    ///
-    /// Since Android 5.0 (ADB v1) does not separate stdout/stderr/exitcode in `shell:`,
-    /// this appends an exit code probe marker to detect command failures, unknown commands,
-    /// and non-zero exit statuses.
-    pub async fn shell_checked(&self, command: &str) -> Result<String> {
-        let marker = "__AIRADB_EXIT_STATUS__";
-        let wrapped_cmd = format!("{}; echo \"\n{}:$?\"", command.trim(), marker);
-        let raw_output = self.shell(&wrapped_cmd).await?;
-
-        if let Some(pos) = raw_output.rfind(marker) {
-            let output_part = raw_output[..pos].trim_end();
-            let exit_part = raw_output[pos + marker.len()..]
-                .trim()
-                .trim_start_matches(':');
-            let exit_code: i32 = exit_part
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .parse()
-                .unwrap_or(0);
-
-            if exit_code != 0 {
-                return Err(AdbError::CommandFailed(format!(
-                    "Command exited with code {}: {}",
-                    exit_code,
-                    output_part.trim()
-                )));
-            }
-            Ok(output_part.to_string())
-        } else {
-            Ok(raw_output)
-        }
-    }
-
-    /// Checks if a specific executable command exists in PATH on the target device.
-    pub async fn has_command(&self, cmd: &str) -> bool {
-        let probe = format!(
-            "command -v \"{}\" >/dev/null 2>&1 || which \"{}\" >/dev/null 2>&1",
-            cmd, cmd
-        );
-        self.shell_checked(&probe).await.is_ok()
-    }
-
-    /// Starts a shell command and returns an `AdbStream` for streaming input and output.
-    pub async fn shell_stream(&self, command: &str) -> Result<AdbStream> {
-        let dest = format_padded_cmd("shell:", command);
-        self.open_stream(&dest).await
-    }
-
-    /// Opens an interactive shell session stream.
+    /// An interactive shell (`shell:` without a command).
     pub async fn interactive_shell(&self) -> Result<AdbStream> {
         self.open_stream("shell:").await
     }
 
-    /// Executes a raw command using the `exec:` service (no PTY mangling), returning raw bytes.
-    ///
-    /// Ideal for pulling binary output such as `screencap -p`.
-    pub async fn exec(&self, command: &str) -> Result<Vec<u8>> {
-        let dest = format_padded_cmd("exec:", command);
-        let mut stream = self.open_stream(&dest).await?;
+    /// A shell command as a stream (for long-running output).
+    pub async fn shell_stream(&self, command: &str) -> Result<AdbStream> {
+        self.open_stream(&padded_service("shell:", command)).await
+    }
+
+    /// `exec:` (no PTY, binary-safe; Android 7+).
+    pub async fn exec_raw(&self, command: &str) -> Result<Vec<u8>> {
+        let mut stream = self.open_stream(&padded_service("exec:", command)).await?;
         stream.read_all().await
     }
 
-    /// Starts an exec command and returns an `AdbStream`.
     pub async fn exec_stream(&self, command: &str) -> Result<AdbStream> {
-        let dest = format_padded_cmd("exec:", command);
-        self.open_stream(&dest).await
+        self.open_stream(&padded_service("exec:", command)).await
     }
 
-    /// Pumps asynchronous `stdin` into a remote `exec:` command and writes remote output into `stdout`.
-    ///
-    /// Perfect for running long-running daemons with NDJSON / streaming RPC.
+    /// Pump `stdin` into an `exec:` command and its output into `stdout`.
     pub async fn exec_pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         &self,
         command: &str,
         stdin: &mut R,
         stdout: &mut W,
     ) -> Result<()> {
-        let stream = self.exec_stream(command).await?;
-        let (mut stream_r, mut stream_w) = tokio::io::split(stream);
-
-        tokio::select! {
-            res1 = tokio::io::copy(stdin, &mut stream_w) => {
-                let _ = res1?;
-                let _ = stream_w.shutdown().await;
-                let _ = tokio::io::copy(&mut stream_r, stdout).await?;
-            }
-            res2 = tokio::io::copy(&mut stream_r, stdout) => {
-                let _ = res2?;
-            }
-        }
-        Ok(())
+        pump(self.exec_stream(command).await?, stdin, stdout).await
     }
 
-    /// Pumps asynchronous `stdin` into a remote `shell:` command and writes remote output into `stdout`.
+    /// Pump `stdin` into a `shell:` command and its output into `stdout`.
     pub async fn shell_pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         &self,
         command: &str,
         stdin: &mut R,
         stdout: &mut W,
     ) -> Result<()> {
-        let stream = self.shell_stream(command).await?;
-        let (mut stream_r, mut stream_w) = tokio::io::split(stream);
+        pump(self.shell_stream(command).await?, stdin, stdout).await
+    }
 
-        tokio::select! {
-            res1 = tokio::io::copy(stdin, &mut stream_w) => {
-                let _ = res1?;
-                let _ = stream_w.shutdown().await;
-                let _ = tokio::io::copy(&mut stream_r, stdout).await?;
-            }
-            res2 = tokio::io::copy(&mut stream_r, stdout) => {
-                let _ = res2?;
+    /// `getprop <name>`, trimmed.
+    pub async fn getprop(&self, name: &str) -> Result<String> {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            return Err(Error::invalid_arg(format!("invalid property name '{name}'")));
+        }
+        Ok(self.shell("getprop").arg(name).await?.trim().to_string())
+    }
+
+    /// Whether `cmd` is on the device's `PATH`.
+    pub async fn has_command(&self, cmd: &str) -> bool {
+        let q = shell_quote(cmd);
+        self.shell_raw(&format!("command -v {q} >/dev/null 2>&1 || which {q} >/dev/null 2>&1; echo $?"))
+            .await
+            .is_ok_and(|out| out.trim().ends_with('0'))
+    }
+
+    // ---------------------------------------------------------------- input
+
+    pub async fn press(&self, key: Key) -> Result<()> {
+        self.press_code(key.android_keycode()).await
+    }
+
+    /// Send any Android `KeyEvent` code.
+    pub async fn press_code(&self, keycode: u32) -> Result<()> {
+        self.shell("input").arg("keyevent").arg(keycode.to_string()).await.map(drop)
+    }
+
+    /// Press keys one after another, stopping at the first failure.
+    pub async fn press_seq(&self, keys: impl IntoIterator<Item = Key>) -> Result<()> {
+        for key in keys {
+            self.press(key).await?;
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- apps
+
+    /// All installed packages.
+    pub async fn apps(&self) -> Result<Vec<Package>> {
+        self.list_packages(false).await
+    }
+
+    /// Packages the user installed (`pm list packages -3`).
+    pub async fn user_apps(&self) -> Result<Vec<Package>> {
+        self.list_packages(true).await
+    }
+
+    async fn list_packages(&self, third_party: bool) -> Result<Vec<Package>> {
+        let mut cmd = self.shell("pm").arg("list").arg("packages").arg("-f");
+        if third_party {
+            cmd = cmd.arg("-3");
+        }
+        let mut list: Vec<Package> = cmd
+            .await?
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("package:"))
+            .map(|rest| {
+                let (apk_path, package) = match rest.rsplit_once('=') {
+                    Some((path, pkg)) => (Some(path.to_string()), pkg.to_string()),
+                    None => (None, rest.to_string()),
+                };
+                let system = match &apk_path {
+                    Some(p) => !p.starts_with("/data/"),
+                    None => !third_party,
+                };
+                Package { package, apk_path, system }
+            })
+            .collect();
+        list.sort_by(|a, b| a.package.cmp(&b.package));
+        Ok(list)
+    }
+
+    /// The focused app, if any.
+    pub async fn foreground(&self) -> Result<Option<Foreground>> {
+        let output = self.shell_raw("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'").await?;
+        Ok(parse_foreground(&output))
+    }
+
+    /// Launch the package's launcher activity.
+    pub async fn launch(&self, package: &PackageName) -> Result<()> {
+        let out = self
+            .shell("monkey")
+            .args(["-p", package.as_str(), "-c", "android.intent.category.LAUNCHER", "1"])
+            .await?;
+        if out.contains("No activities found") {
+            let out = self
+                .shell("am")
+                .args(["start", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.LAUNCHER"])
+                .args(["-p", package.as_str()])
+                .await?;
+            if out.contains("Error:") {
+                return Err(Error::rejected(format!("{package} has no launcher activity")));
             }
         }
         Ok(())
     }
 
-    /// Retrieves an Android system property using `getprop`.
-    pub async fn get_prop(&self, prop_name: &str) -> Result<String> {
-        let cmd = format!("getprop {}", prop_name);
-        let out = self.shell(&cmd).await?;
-        Ok(out.trim().to_string())
+    pub async fn launch_activity(&self, package: &PackageName, activity: &ActivityName) -> Result<()> {
+        let component = format!("{}/{}", package, activity.qualified(package));
+        let out = self.shell("am").arg("start").arg("-n").arg(&component).await?;
+        if out.contains("Error:") {
+            return Err(Error::rejected(format!("am start {component}: {}", out.trim())));
+        }
+        Ok(())
     }
 
-    /// Convenience: gets device model name (`ro.product.model`).
-    pub async fn get_model(&self) -> Result<String> {
-        self.get_prop("ro.product.model").await
+    /// `am force-stop`.
+    pub async fn force_stop(&self, package: &PackageName) -> Result<()> {
+        self.shell("am").arg("force-stop").arg(package.as_str()).await.map(drop)
     }
 
-    /// Convenience: gets Android OS version (`ro.build.version.release`).
-    pub async fn get_android_version(&self) -> Result<String> {
-        self.get_prop("ro.build.version.release").await
+    /// `pm clear`: wipe the app's data and cache.
+    pub async fn clear_data(&self, package: &PackageName) -> Result<()> {
+        let out = self.shell("pm").arg("clear").arg(package.as_str()).await?;
+        expect_success(&out, ErrorKind::Rejected, "pm clear")
     }
 
-    /// Convenience: gets Android SDK API level (`ro.build.version.sdk`).
-    pub async fn get_sdk_version(&self) -> Result<u32> {
-        let val = self.get_prop("ro.build.version.sdk").await?;
-        val.parse::<u32>()
-            .map_err(|e| AdbError::Protocol(format!("Failed to parse SDK version '{}': {}", val, e)))
+    pub async fn uninstall(&self, package: &PackageName) -> Result<()> {
+        let out = self.shell("pm").arg("uninstall").arg(package.as_str()).await?;
+        expect_success(&out, ErrorKind::Rejected, "pm uninstall")
     }
 
-    /// Queries detailed device hardware info (CPU, memory, storage, Android version, Android ID).
-    pub async fn get_hardware_info(&self) -> Result<crate::info::DeviceHardwareInfo> {
+    /// Uninstall but keep data and cache (`pm uninstall -k`).
+    pub async fn uninstall_keep_data(&self, package: &PackageName) -> Result<()> {
+        let out = self.shell("pm").arg("uninstall").arg("-k").arg(package.as_str()).await?;
+        expect_success(&out, ErrorKind::Rejected, "pm uninstall -k")
+    }
+
+    /// Install an APK from a local file; `.await` the request.
+    pub fn install(&self, apk: impl Into<PathBuf>) -> InstallRequest {
+        InstallRequest { device: self.clone(), path: apk.into(), progress: None }
+    }
+
+    // ---------------------------------------------------------------- info
+
+    pub async fn hardware_info(&self) -> Result<crate::info::DeviceHardwareInfo> {
         crate::info::query_device_hardware_info(self).await
     }
 
-    /// Queries the 64-bit unique Android ID (`settings get secure android_id`).
-    pub async fn get_android_id(&self) -> Result<Option<String>> {
-        let out = self.shell("settings get secure android_id").await?;
-        let trimmed = out.trim();
-        if trimmed.is_empty()
-            || trimmed.eq_ignore_ascii_case("null")
-            || trimmed.contains("not found")
-        {
-            Ok(None)
+    /// `settings get secure android_id`, a stable per-device id.
+    pub async fn android_id(&self) -> Result<Option<String>> {
+        let out = self.shell("settings").args(["get", "secure", "android_id"]).await?;
+        let id = out.trim();
+        Ok((!id.is_empty() && !id.eq_ignore_ascii_case("null") && !id.contains("not found")).then(|| id.to_string()))
+    }
+
+    /// A PNG screenshot. Uses `exec:screencap -p`, falling back to a file
+    /// and `sync:` on devices without `exec:` (Android 5/6).
+    pub async fn screencap(&self) -> Result<Vec<u8>> {
+        const PNG_HEADER: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        if let Ok(Ok(png)) = timeout(Duration::from_millis(1500), self.exec_raw("screencap -p")).await {
+            if png.starts_with(PNG_HEADER) {
+                return Ok(png);
+            }
+        }
+        let remote = format!("/data/local/tmp/airadb_shot_{}.png", now_millis());
+        let guard = RemoteFile::new(self, &remote);
+        self.shell("screencap").arg("-p").arg(&remote).await?;
+        let png = self.pull_bytes(&remote).await;
+        guard.remove().await;
+        let png = png?;
+        if png.starts_with(PNG_HEADER) {
+            Ok(png)
         } else {
-            Ok(Some(trimmed.to_string()))
+            Err(Error::protocol("screencap did not produce a PNG"))
         }
     }
 
-    /// Reboots the device into the specified `RebootMode`.
-    pub async fn reboot(&self, mode: RebootMode) -> Result<()> {
-        let mode_str = mode.to_string();
-        let dest = if mode_str.is_empty() {
-            "reboot:".to_string()
-        } else {
-            format!("reboot:{}", mode_str)
-        };
-        let mut stream = self.open_stream(&dest).await?;
-        let _ = stream.read_all().await;
-        Ok(())
-    }
+    // ---------------------------------------------------------------- files
 
-    /// Remounts device partitions in read-write mode.
-    pub async fn remount(&self) -> Result<String> {
-        let mut stream = self.open_stream("remount:").await?;
-        stream.read_string_lossy().await
-    }
-
-    /// Restarts `adbd` listening on the specified TCP port (e.g. 5555).
-    pub async fn tcpip(&self, port: u16) -> Result<String> {
-        let dest = format!("tcpip:{}", port);
-        let mut stream = self.open_stream(&dest).await?;
-        stream.read_string_lossy().await
-    }
-
-    /// Restarts `adbd` with root privileges.
-    pub async fn root(&self) -> Result<String> {
-        let mut stream = self.open_stream("root:").await?;
-        stream.read_string_lossy().await
-    }
-
-    /// Restarts `adbd` without root privileges.
-    pub async fn unroot(&self) -> Result<String> {
-        let mut stream = self.open_stream("unroot:").await?;
-        stream.read_string_lossy().await
-    }
-
-    /// Opens a file synchronization session (`sync:` service).
     pub async fn sync(&self) -> Result<AdbSync> {
-        let stream = self.open_stream("sync:").await?;
-        Ok(AdbSync::new(stream))
+        Ok(AdbSync::new(self.open_stream("sync:").await?))
     }
 
-    /// Pushes in-memory bytes directly to a remote path on the device.
     pub async fn push_bytes(&self, bytes: &[u8], remote_path: &str) -> Result<u64> {
         self.push_bytes_with_mode(bytes, remote_path, DEFAULT_FILE_MODE).await
     }
 
-    /// Pushes in-memory bytes with a specific file permission mode to a remote path.
-    pub async fn push_bytes_with_mode(
-        &self,
-        bytes: &[u8],
-        remote_path: &str,
-        mode: u32,
-    ) -> Result<u64> {
+    pub async fn push_bytes_with_mode(&self, bytes: &[u8], remote_path: &str, mode: u32) -> Result<u64> {
         let mut sync = self.sync().await?;
         let n = sync.push_bytes(bytes, remote_path, mode, 0).await?;
         let _ = sync.quit().await;
         Ok(n)
     }
 
-    /// Pushes a local file to a remote path on the device.
-    pub async fn push_file<P: AsRef<Path>>(
-        &self,
-        local_path: P,
-        remote_path: &str,
-    ) -> Result<u64> {
+    pub async fn push_file<P: AsRef<Path>>(&self, local_path: P, remote_path: &str) -> Result<u64> {
         let mut sync = self.sync().await?;
-        let bytes = sync.push_file(local_path, remote_path).await?;
+        let n = sync.push_file(local_path, remote_path).await?;
         let _ = sync.quit().await;
-        Ok(bytes)
+        Ok(n)
     }
 
-    /// Pulls a remote file from the device to a local path.
-    pub async fn pull_file<P: AsRef<Path>>(
-        &self,
-        remote_path: &str,
-        local_path: P,
-    ) -> Result<u64> {
+    pub async fn pull_file<P: AsRef<Path>>(&self, remote_path: &str, local_path: P) -> Result<u64> {
         let mut sync = self.sync().await?;
-        let bytes = sync.pull_file(remote_path, local_path).await?;
+        let n = sync.pull_file(remote_path, local_path).await?;
         let _ = sync.quit().await;
-        Ok(bytes)
+        Ok(n)
     }
 
-    /// Gets metadata for a file on the device.
-    pub async fn stat(&self, remote_path: &str) -> Result<SyncStat> {
-        let mut sync = self.sync().await?;
-        let stat = sync.stat(remote_path).await?;
-        let _ = sync.quit().await;
-        Ok(stat)
-    }
-
-    /// Lists directory contents on the device.
-    pub async fn list(&self, remote_path: &str) -> Result<Vec<SyncDent>> {
-        let mut sync = self.sync().await?;
-        let entries = sync.list(remote_path).await?;
-        let _ = sync.quit().await;
-        Ok(entries)
-    }
-
-    /// Pulls a remote file directly into an in-memory byte buffer.
     pub async fn pull_bytes(&self, remote_path: &str) -> Result<Vec<u8>> {
         let mut sync = self.sync().await?;
         let mut buf = Vec::new();
@@ -446,239 +558,301 @@ impl AdbDevice {
         Ok(buf)
     }
 
-    /// Captures a screenshot from the device as PNG encoded bytes.
-    ///
-    /// First attempts `exec:screencap -p` for fast direct streaming without disk I/O.
-    /// If `exec:` is unsupported on legacy devices (e.g. Android 5.0), falls back to
-    /// capturing to a temporary file via `shell:` and pulling it via binary `sync:`.
-    pub async fn screencap(&self) -> Result<Vec<u8>> {
-        const PNG_HEADER: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-
-        // Try direct streaming via exec: first (fastest, supported on Android 7+).
-        // Use a short timeout so legacy Android 5.0/5.1 devices that don't support
-        // exec: (or hang on open) immediately fall back to shell + sync pull.
-        if let Ok(Ok(raw_png)) = timeout(Duration::from_millis(1500), self.exec("screencap -p")).await {
-            if raw_png.len() >= 8 && &raw_png[..8] == PNG_HEADER {
-                return Ok(raw_png);
-            }
-        }
-
-        // Fallback for Android 5.0/5.1 devices lacking exec: service
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let remote_tmp_png = format!("/data/local/tmp/airadb_shot_{}.png", now);
-
-        // Run screencap to temporary remote file
-        let _ = self.shell(&format!("screencap -p \"{}\"", remote_tmp_png)).await?;
-
-        // Pull binary file directly into memory
-        let png_res = self.pull_bytes(&remote_tmp_png).await;
-
-        // Cleanup temporary remote file
-        let _ = self.shell(&format!("rm -f \"{}\"", remote_tmp_png)).await;
-
-        let png_bytes = png_res?;
-        if png_bytes.len() >= 8 && &png_bytes[..8] == PNG_HEADER {
-            Ok(png_bytes)
-        } else {
-            Err(AdbError::Protocol("Captured screenshot data is not valid PNG format".into()))
-        }
+    pub async fn stat(&self, remote_path: &str) -> Result<SyncStat> {
+        let mut sync = self.sync().await?;
+        let stat = sync.stat(remote_path).await?;
+        let _ = sync.quit().await;
+        Ok(stat)
     }
 
-    /// Installs an APK on the device.
-    ///
-    /// Pushes the APK to `/data/local/tmp/` via the sync service, executes `pm install`,
-    /// and cleans up the temporary APK file.
-    pub async fn install_apk<P: AsRef<Path>>(&self, local_apk_path: P) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let remote_tmp_apk = format!("/data/local/tmp/airadb_pkg_{}.apk", now);
-
-        self.push_file(local_apk_path, &remote_tmp_apk).await?;
-
-        let install_cmd = format!("pm install -r \"{}\"", remote_tmp_apk);
-        let output = self.shell(&install_cmd).await;
-
-        // Cleanup temporary APK file
-        let _ = self.shell(&format!("rm -f \"{}\"", remote_tmp_apk)).await;
-
-        let output = output?;
-        if output.contains("Success") {
-            Ok(())
-        } else {
-            Err(AdbError::CommandFailed(format!(
-                "pm install failed: {}",
-                output.trim()
-            )))
-        }
+    pub async fn list(&self, remote_path: &str) -> Result<Vec<SyncDent>> {
+        let mut sync = self.sync().await?;
+        let entries = sync.list(remote_path).await?;
+        let _ = sync.quit().await;
+        Ok(entries)
     }
 
-    /// Installs an APK directly from an in-memory byte buffer without local temporary files.
-    pub async fn install_apk_bytes(&self, apk_bytes: &[u8]) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let remote_tmp_apk = format!("/data/local/tmp/airadb_pkg_{}.apk", now);
+    // ---------------------------------------------------------------- adbd
 
-        self.push_bytes(apk_bytes, &remote_tmp_apk).await?;
-
-        let install_cmd = format!("pm install -r \"{}\"", remote_tmp_apk);
-        let output = self.shell(&install_cmd).await;
-
-        // Cleanup temporary APK file
-        let _ = self.shell(&format!("rm -f \"{}\"", remote_tmp_apk)).await;
-
-        let output = output?;
-        if output.contains("Success") {
-            Ok(())
-        } else {
-            Err(AdbError::CommandFailed(format!(
-                "pm install failed: {}",
-                output.trim()
-            )))
-        }
-    }
-
-    /// Lists installed application packages on the device.
-    ///
-    /// - `filter`: optional keyword to filter package names
-    /// - `third_party_only`: if true, lists only user-installed apps (`-3`)
-    pub async fn list_packages(
-        &self,
-        filter: Option<&str>,
-        third_party_only: bool,
-    ) -> Result<Vec<InstalledPackage>> {
-        let flag = if third_party_only { "-3 -f" } else { "-f" };
-        let cmd = format!("pm list packages {}", flag);
-        let raw_output = self.shell(&cmd).await?;
-
-        let mut list = Vec::new();
-        let kw_lower = filter.map(|k| k.trim().to_lowercase());
-
-        for line in raw_output.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("package:") {
-                let (apk_path, pkg_name) = if let Some((path, pkg)) = rest.rsplit_once('=') {
-                    (Some(path.to_string()), pkg.to_string())
-                } else {
-                    (None, rest.to_string())
-                };
-
-                if let Some(ref kw) = kw_lower {
-                    if !pkg_name.to_lowercase().contains(kw) {
-                        continue;
-                    }
-                }
-
-                let is_system = apk_path
-                    .as_deref()
-                    .map(|p| !p.starts_with("/data/"))
-                    .unwrap_or(!third_party_only);
-
-                list.push(InstalledPackage {
-                    package_name: pkg_name,
-                    apk_path,
-                    is_system,
-                });
-            }
-        }
-
-        list.sort_by(|a, b| a.package_name.cmp(&b.package_name));
-        Ok(list)
-    }
-
-    /// Uninstalls an application package from the device.
-    pub async fn uninstall(&self, package_name: &str) -> Result<()> {
-        self.uninstall_package(package_name, false).await
-    }
-
-    /// Uninstalls an application package, optionally preserving app data and cache.
-    pub async fn uninstall_package(&self, package_name: &str, keep_data: bool) -> Result<()> {
-        let flag = if keep_data { "-k " } else { "" };
-        let cmd = format!("pm uninstall {}\"{}\"", flag, package_name);
-        let output = self.shell(&cmd).await?;
-        if output.contains("Success") {
-            Ok(())
-        } else {
-            Err(AdbError::CommandFailed(format!(
-                "pm uninstall failed: {}",
-                output.trim()
-            )))
-        }
-    }
-
-    /// Launches / starts an application package on the device.
-    ///
-    /// If `activity` is specified, launches via `am start -n <package>/<activity>`.
-    /// If `activity` is None, launches via `monkey -p <package> -c android.intent.category.LAUNCHER 1`.
-    pub async fn start_app(&self, package_name: &str, activity: Option<&str>) -> Result<()> {
-        if let Some(act) = activity {
-            let full_act = if act.starts_with('.') {
-                format!("{}{}", package_name, act)
-            } else {
-                act.to_string()
-            };
-            let cmd = format!("am start -n \"{}/{}\"", package_name, full_act);
-            let output = self.shell(&cmd).await?;
-            if output.contains("Error:") {
-                return Err(AdbError::CommandFailed(format!("am start failed: {}", output.trim())));
-            }
-            Ok(())
-        } else {
-            let cmd = format!("monkey -p \"{}\" -c android.intent.category.LAUNCHER 1", package_name);
-            let output = self.shell(&cmd).await?;
-            if output.contains("No activities found to run") || output.contains("** No activities found") {
-                let fallback = format!("am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p \"{}\"", package_name);
-                let fallback_out = self.shell(&fallback).await?;
-                if fallback_out.contains("Error:") {
-                    return Err(AdbError::CommandFailed(format!(
-                        "Could not launch package '{}': neither monkey nor am start found a launcher activity",
-                        package_name
-                    )));
-                }
-            }
-            Ok(())
-        }
-    }
-
-    /// Force stops / closes an application on the device (`am force-stop`).
-    pub async fn stop_app(&self, package_name: &str) -> Result<()> {
-        let cmd = format!("am force-stop \"{}\"", package_name);
-        self.shell(&cmd).await?;
+    pub async fn reboot(&self, mode: RebootMode) -> Result<()> {
+        let mut stream = self.open_stream(&format!("reboot:{mode}")).await?;
+        let _ = stream.read_all().await;
+        self.close().await;
         Ok(())
     }
 
-    /// Clears application cache and local data (`pm clear`).
-    pub async fn clear_app_data(&self, package_name: &str) -> Result<()> {
-        let cmd = format!("pm clear \"{}\"", package_name);
-        let output = self.shell(&cmd).await?;
-        if output.contains("Success") {
-            Ok(())
-        } else {
-            Err(AdbError::CommandFailed(format!("pm clear failed: {}", output.trim())))
-        }
+    pub async fn remount(&self) -> Result<String> {
+        self.open_stream("remount:").await?.read_string_lossy().await
     }
 
-    /// Gets the currently focused foreground application (package and activity) on the device.
-    pub async fn current_app(&self) -> Result<Option<String>> {
-        let output = self.shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'").await?;
-        for line in output.lines() {
-            let line = line.trim();
-            if let Some(pos) = line.find(" u0 ") {
-                let rest = &line[pos + 4..];
-                if let Some(end) = rest.find('}') {
-                    let target = rest[..end].trim();
-                    if !target.is_empty() && target != "null" {
-                        return Ok(Some(target.to_string()));
-                    }
-                }
+    /// Restart adbd listening on TCP `port`.
+    pub async fn tcpip(&self, port: u16) -> Result<String> {
+        self.open_stream(&format!("tcpip:{port}")).await?.read_string_lossy().await
+    }
+
+    pub async fn root(&self) -> Result<String> {
+        self.open_stream("root:").await?.read_string_lossy().await
+    }
+
+    pub async fn unroot(&self) -> Result<String> {
+        self.open_stream("unroot:").await?.read_string_lossy().await
+    }
+}
+
+async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    stream: AdbStream,
+    stdin: &mut R,
+    stdout: &mut W,
+) -> Result<()> {
+    let (mut stream_r, mut stream_w) = tokio::io::split(stream);
+    tokio::select! {
+        res = tokio::io::copy(stdin, &mut stream_w) => {
+            res?;
+            let _ = stream_w.shutdown().await;
+            tokio::io::copy(&mut stream_r, stdout).await?;
+        }
+        res = tokio::io::copy(&mut stream_r, stdout) => {
+            res?;
+        }
+    }
+    Ok(())
+}
+
+fn expect_success(output: &str, kind: ErrorKind, what: &str) -> Result<()> {
+    if output.contains("Success") {
+        Ok(())
+    } else {
+        Err(Error::new(kind, format!("{what} failed: {}", output.trim())))
+    }
+}
+
+pub(crate) fn parse_foreground(output: &str) -> Option<Foreground> {
+    for line in output.lines() {
+        let Some(pos) = line.find(" u0 ") else { continue };
+        let rest = &line[pos + 4..];
+        let end = rest.find(['}', ' ']).unwrap_or(rest.len());
+        let target = rest[..end].trim();
+        if target.is_empty() || target == "null" {
+            continue;
+        }
+        return Some(match target.split_once('/') {
+            Some((package, activity)) => {
+                let activity =
+                    if activity.starts_with('.') { format!("{package}{activity}") } else { activity.to_string() };
+                Foreground { package: package.to_string(), activity: Some(activity) }
+            }
+            None => Foreground { package: target.to_string(), activity: None },
+        });
+    }
+    None
+}
+
+/// A shell command under construction. `.await` it for its output.
+#[must_use = "a shell command does nothing until awaited"]
+pub struct ShellCommand {
+    device: Device,
+    line: String,
+    checked: bool,
+}
+
+impl ShellCommand {
+    /// Append one argument, quoted.
+    pub fn arg(mut self, arg: impl AsRef<str>) -> Self {
+        self.line.push(' ');
+        self.line.push_str(&shell_quote(arg.as_ref()));
+        self
+    }
+
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            self = self.arg(arg);
+        }
+        self
+    }
+
+    /// Fail with [`ErrorKind::Rejected`] when the command exits non-zero.
+    /// (Android < 7 has no separate exit status; a marker is echoed.)
+    pub fn checked(mut self) -> Self {
+        self.checked = true;
+        self
+    }
+
+    /// The command line that will run.
+    pub fn command_line(&self) -> &str {
+        &self.line
+    }
+
+    pub async fn bytes(self) -> Result<Vec<u8>> {
+        self.device.shell_raw_bytes(&self.line).await
+    }
+
+    async fn run(self) -> Result<String> {
+        if !self.checked {
+            return self.device.shell_raw(&self.line).await;
+        }
+        const MARKER: &str = "__AIRADB_EXIT_STATUS__";
+        let raw = self.device.shell_raw(&format!("{}; echo \"\n{MARKER}:$?\"", self.line)).await?;
+        let Some(pos) = raw.rfind(MARKER) else { return Ok(raw) };
+        let output = raw[..pos].trim_end().to_string();
+        let code: i32 = raw[pos + MARKER.len()..].trim().trim_start_matches(':').trim().parse().unwrap_or(0);
+        if code == 0 {
+            Ok(output)
+        } else {
+            Err(Error::rejected(format!("`{}` exited with {code}: {}", self.line, output.trim())))
+        }
+    }
+}
+
+impl IntoFuture for ShellCommand {
+    type Output = Result<String>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.run())
+    }
+}
+
+/// A temporary file on the device, removed even if the operation using it
+/// is cancelled (dropped) half-way.
+struct RemoteFile {
+    device: Device,
+    path: String,
+    armed: bool,
+}
+
+impl RemoteFile {
+    fn new(device: &Device, path: &str) -> Self {
+        Self { device: device.clone(), path: path.to_string(), armed: true }
+    }
+
+    async fn remove(mut self) {
+        self.armed = false;
+        let _ = timeout(Duration::from_secs(10), self.device.shell("rm").arg("-f").arg(&self.path)).await;
+    }
+}
+
+impl Drop for RemoteFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let (device, path) = (self.device.clone(), self.path.clone());
+            rt.spawn(async move {
+                let _ = timeout(Duration::from_secs(10), device.shell("rm").arg("-f").arg(&path)).await;
+            });
+        }
+    }
+}
+
+type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// An APK install; `.await` it. Dropping the future cancels the upload and
+/// removes the partial file from the device.
+#[must_use = "an install does nothing until awaited"]
+pub struct InstallRequest {
+    device: Device,
+    path: PathBuf,
+    progress: Option<ProgressFn>,
+}
+
+impl InstallRequest {
+    /// Called with `(sent, total)` bytes while uploading.
+    pub fn on_progress(mut self, f: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        self.progress = Some(Arc::new(f));
+        self
+    }
+
+    async fn run(self) -> Result<()> {
+        let file = tokio::fs::File::open(&self.path)
+            .await
+            .map_err(|e| Error::invalid_arg(format!("cannot open {}: {e}", self.path.display())))?;
+        let total = file.metadata().await?.len();
+        let remote = format!("/data/local/tmp/airadb_pkg_{}_{:04x}.apk", now_millis(), rand_u16());
+        let tmp = RemoteFile::new(&self.device, &remote);
+
+        let mut sync = self.device.sync().await?;
+        let mut reader = ProgressReader { inner: file, sent: 0, total, progress: self.progress.clone() };
+        if let Some(cb) = &self.progress {
+            cb(0, total);
+        }
+        sync.push(&mut reader, &remote, DEFAULT_FILE_MODE, 0).await?;
+        let _ = sync.quit().await;
+
+        let out = self.device.shell("pm").arg("install").arg("-r").arg(&remote).await;
+        tmp.remove().await;
+        expect_success(&out?, ErrorKind::InstallFailed, "pm install")
+    }
+}
+
+impl IntoFuture for InstallRequest {
+    type Output = Result<()>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.run())
+    }
+}
+
+fn rand_u16() -> u16 {
+    let mut b = [0u8; 2];
+    let _ = getrandom::fill(&mut b);
+    u16::from_le_bytes(b)
+}
+
+struct ProgressReader<R> {
+    inner: R,
+    sent: u64,
+    total: u64,
+    progress: Option<ProgressFn>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let n = (buf.filled().len() - before) as u64;
+        if n > 0 {
+            self.sent += n;
+            if let Some(cb) = &self.progress {
+                cb(self.sent, self.total);
             }
         }
-        Ok(None)
+        poll
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting() {
+        assert_eq!(shell_quote("com.example.app"), "com.example.app");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("$(reboot)"), "'$(reboot)'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("x;rm -rf /"), "'x;rm -rf /'");
+        assert_eq!(shell_quote("Main$Inner"), "'Main$Inner'");
+    }
+
+    #[test]
+    fn foreground_parsing() {
+        let out = "  mCurrentFocus=Window{4a1 u0 com.mitv.tvhome/com.mitv.tvhome.MainActivity}\n";
+        assert_eq!(
+            parse_foreground(out),
+            Some(Foreground {
+                package: "com.mitv.tvhome".into(),
+                activity: Some("com.mitv.tvhome.MainActivity".into())
+            })
+        );
+        let out = "  mFocusedApp=AppWindowToken{x token=Token{y ActivityRecord{z u0 com.a/.Main t5}}}";
+        assert_eq!(parse_foreground(out).unwrap().activity.as_deref(), Some("com.a.Main"));
+        assert_eq!(parse_foreground("mCurrentFocus=null"), None);
     }
 }

@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use crate::error::{AdbError, Result};
+use crate::error::{Error, Result};
 use crate::packet::{AdbPacket, A_CLSE, A_WRTE};
 
 /// A bidirectional multiplexed stream over an ADB connection.
@@ -46,6 +46,13 @@ impl AdbStream {
             closed,
             waiting_ack: false,
         }
+    }
+
+    fn closed_error(&self) -> Error {
+        Error::new(
+            crate::ErrorKind::Disconnected,
+            format!("stream closed (local {}, remote {})", self.local_id, self.remote_id),
+        )
     }
 
     /// Returns the local stream identifier.
@@ -122,10 +129,7 @@ impl AdbStream {
     /// acknowledgment from the device after each chunk according to the ADB protocol.
     pub async fn write_all(&mut self, data: &[u8]) -> Result<()> {
         if self.is_closed() {
-            return Err(AdbError::StreamClosed {
-                local_id: self.local_id,
-                remote_id: self.remote_id,
-            });
+            return Err(self.closed_error());
         }
 
         let chunk_size = cmp::min(self.max_payload, 64 * 1024);
@@ -140,17 +144,12 @@ impl AdbStream {
             self.writer_tx
                 .send(packet)
                 .await
-                .map_err(|_| AdbError::ConnectionClosed)?;
+                .map_err(|_| Error::disconnected())?;
 
             // Wait for A_OKAY acknowledgment before sending next chunk
             match self.write_ack_rx.recv().await {
                 Some(()) => {}
-                None => {
-                    return Err(AdbError::StreamClosed {
-                        local_id: self.local_id,
-                        remote_id: self.remote_id,
-                    });
-                }
+                None => return Err(self.closed_error()),
             }
         }
 
