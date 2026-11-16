@@ -22,6 +22,8 @@ pub enum ErrorKind {
     Rejected,
     /// `pm install` reported failure.
     InstallFailed,
+    /// The package (or its icon) is not on the device.
+    NotFound,
     /// A caller-supplied argument is malformed.
     InvalidArg,
     /// Something on the wire did not follow the ADB protocol.
@@ -44,6 +46,7 @@ impl ErrorKind {
             Self::Disconnected => "disconnected",
             Self::Rejected => "rejected",
             Self::InstallFailed => "install failed",
+            Self::NotFound => "not found",
             Self::InvalidArg => "invalid argument",
             Self::Protocol => "protocol",
             Self::Key => "key",

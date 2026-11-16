@@ -384,12 +384,13 @@ async fn apps_foreground_and_stop() {
     mock.trust(&k);
     let dev = Client::new(k).device(mock.addr);
 
-    let apps = dev.apps().await.unwrap();
-    assert_eq!(apps.len(), 2);
-    assert!(apps.iter().any(|a| a.package == "com.android.settings" && a.system));
-    let user = dev.user_apps().await.unwrap();
-    assert_eq!(user.len(), 1);
-    assert!(!user[0].system);
+    // The mock cannot run the helper dex: listing falls back to `pm`, unnamed.
+    let all = dev.all_apps().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().any(|a| a.package == "com.android.settings" && a.system && a.name.is_none()));
+    let launcher = dev.apps().await.unwrap();
+    assert_eq!(launcher.len(), 1);
+    assert!(!launcher[0].system);
 
     let fg = dev.foreground().await.unwrap().unwrap();
     assert_eq!(fg.package, "com.mitv.tvhome");

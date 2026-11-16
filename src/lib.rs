@@ -18,6 +18,7 @@
 
 #[cfg(feature = "blocking")]
 pub mod blocking;
+mod apps;
 mod client;
 mod connection;
 mod crypto;
@@ -30,11 +31,12 @@ mod stream;
 mod sync;
 mod types;
 
+pub use apps::App;
 pub use client::{Client, ClientBuilder};
 pub use connection::AdbConnection;
 pub use crypto::KeyPair;
 pub use device::{
-    shell_quote, AuthPrompt, Authorization, Device, Foreground, InstallRequest, Package, RebootMode, ShellCommand,
+    shell_quote, AuthPrompt, Authorization, Device, Foreground, InstallRequest, RebootMode, ShellCommand,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use info::DeviceHardwareInfo;

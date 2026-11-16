@@ -42,15 +42,6 @@ impl fmt::Display for RebootMode {
     }
 }
 
-/// An installed package.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Package {
-    /// The package name as the device reports it.
-    pub package: String,
-    pub apk_path: Option<String>,
-    pub system: bool,
-}
-
 /// The focused app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Foreground {
@@ -387,41 +378,6 @@ impl Device {
     }
 
     // ---------------------------------------------------------------- apps
-
-    /// All installed packages.
-    pub async fn apps(&self) -> Result<Vec<Package>> {
-        self.list_packages(false).await
-    }
-
-    /// Packages the user installed (`pm list packages -3`).
-    pub async fn user_apps(&self) -> Result<Vec<Package>> {
-        self.list_packages(true).await
-    }
-
-    async fn list_packages(&self, third_party: bool) -> Result<Vec<Package>> {
-        let mut cmd = self.shell("pm").arg("list").arg("packages").arg("-f");
-        if third_party {
-            cmd = cmd.arg("-3");
-        }
-        let mut list: Vec<Package> = cmd
-            .await?
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("package:"))
-            .map(|rest| {
-                let (apk_path, package) = match rest.rsplit_once('=') {
-                    Some((path, pkg)) => (Some(path.to_string()), pkg.to_string()),
-                    None => (None, rest.to_string()),
-                };
-                let system = match &apk_path {
-                    Some(p) => !p.starts_with("/data/"),
-                    None => !third_party,
-                };
-                Package { package, apk_path, system }
-            })
-            .collect();
-        list.sort_by(|a, b| a.package.cmp(&b.package));
-        Ok(list)
-    }
 
     /// The focused app, if any.
     pub async fn foreground(&self) -> Result<Option<Foreground>> {

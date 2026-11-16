@@ -649,29 +649,28 @@ async fn list_apps(
     system: bool,
     filter: Option<&str>,
 ) -> Result<()> {
-    let mut pkgs = if third_party && !system {
-        device.user_apps().await?
-    } else {
-        device.apps().await?
-    };
-    if system && !third_party {
-        pkgs.retain(|p| p.system);
+    // No flag: what the launcher shows. -3 / -s: every package, filtered.
+    let mut apps = if third_party || system { device.all_apps().await? } else { device.apps().await? };
+    if third_party != system {
+        apps.retain(|a| a.system == system);
     }
     if let Some(f) = filter {
-        pkgs.retain(|p| p.package.contains(f));
+        apps.retain(|a| a.package.contains(f) || a.name.as_deref().is_some_and(|n| n.contains(f)));
     }
     let label = match (third_party, system) {
-        (true, false) => "Third-party (User)",
+        (true, false) => "Third-party",
         (false, true) => "System",
-        _ => "Installed",
+        (true, true) => "Installed",
+        _ => "Launcher",
     };
-    println!("{label} packages ({} total):\n", pkgs.len());
-    for (i, p) in pkgs.iter().enumerate() {
+    println!("{label} apps ({} total):\n", apps.len());
+    for (i, a) in apps.iter().enumerate() {
         println!(
-            "{:>4}  {:<60} {}",
+            "{:>4}  {:<24} {:<56} {}",
             i + 1,
-            p.package,
-            if p.system { "system" } else { "user" }
+            a.name.as_deref().unwrap_or("-"),
+            a.package,
+            if a.system { "system" } else { "user" }
         );
     }
     Ok(())

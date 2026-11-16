@@ -77,6 +77,19 @@ tv.install("app-release.apk")
 
 The APK is pushed to `/data/local/tmp/`, installed with `pm install -r` and removed, also when the future is dropped half-way.
 
+### Apps, names and icons
+
+```rust
+# async fn demo(tv: airadb::Device) -> airadb::Result<()> {
+for app in tv.apps().await? {               // launcher apps (phone and TV); all_apps() for every package
+    println!("{} {:?}", app.package, app.name); // name: the label the launcher shows
+}
+let png = tv.app_icon(&airadb::PackageName::new("com.android.settings")?).await?;
+# Ok(()) }
+```
+
+`pm` prints neither labels nor icons, so a 4 KB dex (`helper/`, embedded in the crate) is pushed to `/data/local/tmp/` on first use and run with `app_process` as the shell user; it asks `PackageManager`. No APK is installed and no root is needed. Where it cannot run, listing falls back to `pm` without names. Rebuild it with `helper/build.sh` after editing `Helper.java`.
+
 ### Discovery
 
 ```rust
