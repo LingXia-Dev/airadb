@@ -11,8 +11,10 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::packet::{
+    read_packet, write_packet, AdbPacket, A_AUTH, A_CNXN, A_VERSION_SKIP_CHECKSUM,
+};
 use crate::types::Subnet;
-use crate::packet::{read_packet, write_packet, AdbPacket, A_AUTH, A_CNXN, A_VERSION_SKIP_CHECKSUM};
 
 /// Default TCP port for standard ADB daemon.
 pub const DEFAULT_ADB_PORT: u16 = 5555;
@@ -46,7 +48,10 @@ fn parse_banner_props(banner: &str) -> (Option<String>, Option<String>, Option<S
     let mut product = None;
     let mut device = None;
 
-    let props_str = banner.split_once("::").map(|(_, rest)| rest).unwrap_or(banner);
+    let props_str = banner
+        .split_once("::")
+        .map(|(_, rest)| rest)
+        .unwrap_or(banner);
 
     for part in props_str.split(';') {
         let part = part.trim();
@@ -67,8 +72,14 @@ fn parse_banner_props(banner: &str) -> (Option<String>, Option<String>, Option<S
 /// to verify whether an actual ADB daemon is listening.
 ///
 /// Returns `Some(DiscoveredDevice)` if the target responds with `A_CNXN` or `A_AUTH`.
-pub(crate) async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Option<DiscoveredDevice> {
-    // 1. Establish TCP connection with timeout
+pub(crate) async fn probe_adb_device(
+    addr: SocketAddr,
+    timeout_dur: Duration,
+) -> Option<DiscoveredDevice> {
+    // 1. Establish TCP connection with timeout.
+    // On lossy 2.4GHz WiFi (e.g. Android 5 TV boxes with 20% packet loss),
+    // allowing at least ~1000-1200ms lets the OS kernel perform a native SYN retransmission
+    // without flooding the wireless driver.
     let mut stream = timeout(timeout_dur, TcpStream::connect(addr))
         .await
         .ok()?
@@ -77,20 +88,16 @@ pub(crate) async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) ->
 
     // 2. Send initial A_CNXN packet
     let connect_banner = b"host::features=cmd\0".to_vec();
-    let init_packet = AdbPacket::new(
-        A_CNXN,
-        A_VERSION_SKIP_CHECKSUM,
-        256 * 1024,
-        connect_banner,
-    );
+    let init_packet = AdbPacket::new(A_CNXN, A_VERSION_SKIP_CHECKSUM, 256 * 1024, connect_banner);
 
-    timeout(timeout_dur, write_packet(&mut stream, &init_packet))
+    let rw_timeout = Duration::from_millis(600).max(timeout_dur);
+    timeout(rw_timeout, write_packet(&mut stream, &init_packet))
         .await
         .ok()?
         .ok()?;
 
     // 3. Await ADB response packet
-    let response = timeout(timeout_dur, read_packet(&mut stream, false))
+    let response = timeout(rw_timeout, read_packet(&mut stream, false))
         .await
         .ok()?
         .ok()?;
@@ -137,7 +144,7 @@ fn build_mdns_ptr_query(service_name: &str) -> Vec<u8> {
     packet.push(0x00); // Root label
 
     packet.extend_from_slice(&[0x00, 0x0c]); // Type: PTR (12)
-    packet.extend_from_slice(&[0x00, 0x01]); // Class: IN (1)
+    packet.extend_from_slice(&[0x80, 0x01]); // Class: IN (1) with QU (unicast-response) bit set
     packet
 }
 
@@ -242,9 +249,15 @@ pub(crate) fn parse_mdns_response(buf: &[u8], peer_ip: Ipv4Addr) -> Vec<SocketAd
         vec![peer_ip]
     };
 
+    let ports = if !srv_ports.is_empty() {
+        srv_ports
+    } else {
+        vec![DEFAULT_ADB_PORT]
+    };
+
     let mut endpoints = Vec::new();
     for ip in ips {
-        for &port in &srv_ports {
+        for &port in &ports {
             endpoints.push(SocketAddr::new(IpAddr::V4(ip), port));
         }
     }
@@ -265,15 +278,21 @@ pub struct Discover {
     mdns: bool,
 }
 
+impl Default for Discover {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Discover {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             subnets: BTreeSet::new(),
             hosts: BTreeSet::new(),
             ports: DEFAULT_ADB_PORTS.to_vec(),
-            duration: Duration::from_secs(3),
-            probe_timeout: Duration::from_millis(800),
-            concurrency: 96,
+            duration: Duration::from_millis(5000),
+            probe_timeout: Duration::from_millis(1200),
+            concurrency: 256,
             mdns: true,
         }
     }
@@ -297,19 +316,23 @@ impl Discover {
         self
     }
 
-    /// Upper bound for the whole discovery. Default 3s.
+    /// Upper bound for the whole discovery. Default 5.0s.
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.duration = duration;
         self
     }
 
-    /// Per-address connect + reply timeout. Default 800ms.
+    /// Per-address connect + reply timeout. Default 1200ms.
+    ///
+    /// Setting this to at least 1100-1200ms gives the OS kernel enough time
+    /// to perform its native RFC 6298 SYN retransmission (at 1000ms) on lossy
+    /// 2.4GHz Wi-Fi networks (common on older Android 5 TV boxes).
     pub fn probe_timeout(mut self, duration: Duration) -> Self {
         self.probe_timeout = duration;
         self
     }
 
-    /// Probes in flight at once. Default 96.
+    /// Probes in flight at once. Default 256.
     pub fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
@@ -330,10 +353,9 @@ impl Discover {
         let mut ips: BTreeSet<Ipv4Addr> = self.hosts;
         let mut subnets = self.subnets;
         if ips.is_empty() && subnets.is_empty() {
-            subnets.insert(
-                Subnet::detect()
-                    .ok_or_else(|| Error::new(ErrorKind::NoNetwork, "no local IPv4 network to discover on"))?,
-            );
+            subnets.insert(Subnet::detect().ok_or_else(|| {
+                Error::new(ErrorKind::NoNetwork, "no local IPv4 network to discover on")
+            })?);
         }
         for subnet in &subnets {
             ips.extend(subnet.hosts());
@@ -353,22 +375,98 @@ impl Discover {
         let shared = Arc::new(Shared {
             probe_timeout: self.probe_timeout,
             seen: Mutex::new(HashSet::new()),
+            discovered_ips: Mutex::new(HashSet::new()),
             limit: Semaphore::new(self.concurrency),
             subnets,
             explicit: ips.clone(),
         });
         let (tx, rx) = mpsc::channel(64);
         let mut tasks = JoinSet::new();
-        for ip in ips {
-            for &port in &self.ports {
-                tasks.spawn(probe(shared.clone(), SocketAddr::new(IpAddr::V4(ip), port), tx.clone()));
-            }
-        }
+
         if let Some(socket) = mdns_socket {
-            tasks.spawn(mdns_query(shared.clone(), socket, self.duration, tx.clone()));
+            tasks.spawn(mdns_query(
+                shared.clone(),
+                socket,
+                self.duration,
+                tx.clone(),
+            ));
         }
+
+        let ports = self.ports.clone();
+        let ips_vec: Vec<Ipv4Addr> = ips.into_iter().collect();
+        let driver_shared = shared.clone();
+        let driver_tx = tx.clone();
+
+        // Staged scanning coordinator task:
+        tasks.spawn(async move {
+            // Phase 1: Probe default primary port (5555) on all targets in parallel.
+            if ports.contains(&DEFAULT_ADB_PORT) {
+                let mut phase1 = JoinSet::new();
+                for &ip in &ips_vec {
+                    phase1.spawn(probe(
+                        driver_shared.clone(),
+                        SocketAddr::new(IpAddr::V4(ip), DEFAULT_ADB_PORT),
+                        driver_tx.clone(),
+                    ));
+                }
+                while phase1.join_next().await.is_some() {}
+
+                // Phase 2: Second-chance retry on port 5555 ONLY for targets not yet discovered.
+                // This specifically handles lossy 2.4GHz WiFi (e.g. Android 5 TV boxes) where initial SYNs dropped.
+                let missing: Vec<Ipv4Addr> = {
+                    let disc = driver_shared.discovered_ips.lock().unwrap();
+                    ips_vec
+                        .iter()
+                        .filter(|ip| !disc.contains(&IpAddr::V4(**ip)))
+                        .copied()
+                        .collect()
+                };
+                if !missing.is_empty() {
+                    let mut phase2 = JoinSet::new();
+                    for ip in missing {
+                        phase2.spawn(probe(
+                            driver_shared.clone(),
+                            SocketAddr::new(IpAddr::V4(ip), DEFAULT_ADB_PORT),
+                            driver_tx.clone(),
+                        ));
+                    }
+                    while phase2.join_next().await.is_some() {}
+                }
+            }
+
+            // Phase 3: Secondary ports (e.g. 9527, 5566) ONLY for targets not yet discovered.
+            let missing: Vec<Ipv4Addr> = {
+                let disc = driver_shared.discovered_ips.lock().unwrap();
+                ips_vec
+                    .iter()
+                    .filter(|ip| !disc.contains(&IpAddr::V4(**ip)))
+                    .copied()
+                    .collect()
+            };
+            if !missing.is_empty() {
+                let mut phase3 = JoinSet::new();
+                for &port in &ports {
+                    if port != DEFAULT_ADB_PORT {
+                        for &ip in &missing {
+                            phase3.spawn(probe(
+                                driver_shared.clone(),
+                                SocketAddr::new(IpAddr::V4(ip), port),
+                                driver_tx.clone(),
+                            ));
+                        }
+                    }
+                }
+                while phase3.join_next().await.is_some() {}
+            }
+        });
+
         drop(tx);
-        Ok(Discovery { rx, _tasks: tasks, deadline: Box::pin(tokio::time::sleep(self.duration)), finished: false })
+        Ok(Discovery {
+            rx,
+            _tasks: tasks,
+            deadline: Box::pin(tokio::time::sleep(self.duration)),
+            finished: false,
+        })
     }
 }
 
@@ -431,6 +529,7 @@ impl futures_core::Stream for Discovery {
 struct Shared {
     probe_timeout: Duration,
     seen: Mutex<HashSet<SocketAddr>>,
+    discovered_ips: Mutex<HashSet<IpAddr>>,
     limit: Semaphore,
     subnets: BTreeSet<Subnet>,
     explicit: BTreeSet<Ipv4Addr>,
@@ -444,12 +543,25 @@ impl Shared {
 }
 
 async fn probe(shared: Arc<Shared>, addr: SocketAddr, tx: mpsc::Sender<DiscoveredDevice>) {
-    let Ok(_permit) = shared.limit.acquire().await else { return };
+    // If an ADB device has already responded on this IP (e.g. standard port 5555),
+    // skip probing secondary ports on the same host to avoid redundant load and duplicate reports.
+    if shared.discovered_ips.lock().unwrap().contains(&addr.ip()) {
+        return;
+    }
+    let Ok(_permit) = shared.limit.acquire().await else {
+        return;
+    };
     if shared.seen.lock().unwrap().contains(&addr) {
         return;
     }
-    let Some(found) = probe_adb_device(addr, shared.probe_timeout).await else { return };
+    if shared.discovered_ips.lock().unwrap().contains(&addr.ip()) {
+        return;
+    }
+    let Some(found) = probe_adb_device(addr, shared.probe_timeout).await else {
+        return;
+    };
     if shared.seen.lock().unwrap().insert(addr) {
+        shared.discovered_ips.lock().unwrap().insert(addr.ip());
         let _ = tx.send(found).await;
     }
 }
@@ -461,15 +573,24 @@ async fn mdns_query(
     tx: mpsc::Sender<DiscoveredDevice>,
 ) {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)), 5353);
-    if let Err(e) = socket.send_to(&build_mdns_ptr_query("_adb._tcp.local"), group).await {
+    if let Err(e) = socket
+        .send_to(&build_mdns_ptr_query("_adb._tcp.local"), group)
+        .await
+    {
         tracing::debug!("mDNS query not sent: {e}");
         return;
     }
     let mut probes = JoinSet::new();
     let mut buf = [0u8; 4096];
-    let deadline = tokio::time::Instant::now() + duration;
-    while let Ok(Ok((len, peer))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
-        let IpAddr::V4(peer_ip) = peer.ip() else { continue };
+    // mDNS responses arrive within tens to hundreds of milliseconds.
+    // Cap listener window so Discovery finishes promptly once TCP probes complete.
+    let mdns_deadline = tokio::time::Instant::now() + Duration::from_millis(1500).min(duration);
+    while let Ok(Ok((len, peer))) =
+        tokio::time::timeout_at(mdns_deadline, socket.recv_from(&mut buf)).await
+    {
+        let IpAddr::V4(peer_ip) = peer.ip() else {
+            continue;
+        };
         for endpoint in parse_mdns_response(&buf[..len], peer_ip) {
             if let IpAddr::V4(ip) = endpoint.ip() {
                 if shared.wanted(ip) {
