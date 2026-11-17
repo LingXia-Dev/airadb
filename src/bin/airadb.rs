@@ -84,11 +84,18 @@ enum Commands {
         local: Option<PathBuf>,
     },
 
-    /// Capture a screenshot from the device and save as PNG
+    /// Capture a screenshot: full-size PNG, or with --width a small JPEG
+    /// scaled on the device
     Screencap {
         /// Destination local file path (defaults to "screenshot.png")
         #[arg(default_value = "screenshot.png")]
         out: PathBuf,
+        /// Scale to at most this many pixels wide and send a JPEG
+        #[arg(long)]
+        width: Option<u32>,
+        /// JPEG quality (1-100) with --width
+        #[arg(long, default_value_t = 70)]
+        quality: u8,
     },
 
     /// Get file metadata (stat)
@@ -512,8 +519,11 @@ async fn run(cli: Cli) -> Result<()> {
                 device.pull_file(&remote, &dest).await?
             );
         }
-        Commands::Screencap { out } => {
-            let png = device.screencap().await?;
+        Commands::Screencap { out, width, quality } => {
+            let png = match width {
+                Some(w) => device.screenshot(w, quality).await?,
+                None => device.screencap().await?,
+            };
             tokio::fs::write(&out, &png).await?;
             println!(
                 "Saved screenshot ({} bytes) to {}",

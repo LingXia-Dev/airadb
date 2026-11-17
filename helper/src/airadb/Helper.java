@@ -10,7 +10,10 @@ import android.graphics.Canvas;
 import android.graphics.drawable.Drawable;
 import android.os.Looper;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -21,9 +24,15 @@ import java.util.Set;
  *
  *   apps [all]         one app per line: package TAB system(0|1) TAB label
  *   icon <pkg> <size>  the launcher icon as PNG on stdout
+ *   shot <width> <q>   raw `screencap` on stdin -> JPEG at most <width> wide
  */
 public final class Helper {
     public static void main(String[] args) throws Exception {
+        if (args.length >= 3 && args[0].equals("shot")) {
+            shot(System.in, Integer.parseInt(args[1]), Integer.parseInt(args[2]), System.out);
+            System.out.flush();
+            System.exit(0);
+        }
         Looper.prepareMainLooper();
         Class<?> at = Class.forName("android.app.ActivityThread");
         Object thread = at.getMethod("systemMain").invoke(null);
@@ -47,11 +56,45 @@ public final class Helper {
             d.draw(new Canvas(bmp));
             bmp.compress(Bitmap.CompressFormat.PNG, 100, out);
         } else {
-            System.err.println("usage: apps [all] | icon <pkg> <size>");
+            System.err.println("usage: apps [all] | icon <pkg> <size> | shot <width> <quality>");
             System.exit(2);
         }
         out.flush();
         System.exit(0);
+    }
+
+    /**
+     * Raw screencap: width, height, format (u32 LE), plus a u32 colour
+     * space on Android 9+, then the pixels. The header size follows from
+     * the length. Scaled down (never up) and sent as JPEG: a fraction of
+     * the full-size PNG over a slow network.
+     */
+    private static void shot(InputStream in, int maxWidth, int quality, PrintStream out) throws Exception {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(8 << 20);
+        byte[] chunk = new byte[1 << 16];
+        for (int n; (n = in.read(chunk)) > 0; ) buf.write(chunk, 0, n);
+        byte[] raw = buf.toByteArray();
+        ByteBuffer head = ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        int w = head.getInt(0), h = head.getInt(4), format = head.getInt(8);
+        // PixelFormat: RGBA_8888 = 1, RGBX_8888 = 2, RGB_565 = 4.
+        boolean rgb565 = format == 4;
+        int pixels = w * h * (rgb565 ? 2 : 4);
+        int header = raw.length - pixels;
+        if (w <= 0 || h <= 0 || (header != 12 && header != 16)) {
+            throw new IllegalStateException("unexpected screencap: " + w + "x" + h + " format " + format + ", " + raw.length + " bytes");
+        }
+        Bitmap bmp = Bitmap.createBitmap(w, h, rgb565 ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888);
+        // A direct buffer: some devices crash copying from an offset heap one.
+        ByteBuffer px = ByteBuffer.allocateDirect(pixels);
+        px.put(raw, header, pixels).rewind();
+        raw = null;
+        bmp.copyPixelsFromBuffer(px);
+        if (w > maxWidth) {
+            Bitmap scaled = Bitmap.createScaledBitmap(bmp, maxWidth, Math.max(1, (int) ((long) h * maxWidth / w)), true);
+            bmp.recycle();
+            bmp = scaled;
+        }
+        bmp.compress(Bitmap.CompressFormat.JPEG, quality, out);
     }
 
     /** Packages with a phone or TV launcher entry. */

@@ -88,7 +88,18 @@ let png = tv.app_icon(&airadb::PackageName::new("com.android.settings")?).await?
 # Ok(()) }
 ```
 
-`pm` prints neither labels nor icons, so a 4 KB dex (`helper/`, embedded in the crate) is pushed to `/data/local/tmp/` on first use and run with `app_process` as the shell user; it asks `PackageManager`. No APK is installed and no root is needed. Where it cannot run, listing falls back to `pm` without names. Rebuild it with `helper/build.sh` after editing `Helper.java`.
+`pm` prints neither labels nor icons, so a 6 KB dex (`helper/`, embedded in the crate) is pushed to `/data/local/tmp/` on first use and run with `app_process` as the shell user; it asks `PackageManager`. No APK is installed and no root is needed. Where it cannot run, listing falls back to `pm` without names. Rebuild it with `helper/build.sh` after editing `Helper.java`.
+
+### Small screenshots
+
+```rust
+# async fn demo(tv: airadb::Device) -> airadb::Result<()> {
+let jpeg = tv.screenshot(720, 70).await?; // at most 720 px wide, JPEG quality 70
+let png = tv.screencap().await?;          // full size
+# Ok(()) }
+```
+
+The helper scales a raw `screencap` on the device, so only the JPEG crosses the network: on a 1080p TV, 36 KB in 1.7s against a 3.2 MB PNG in 19.5s over store Wi-Fi. Where the helper cannot run, `screenshot` returns the full PNG.
 
 ### Discovery
 
@@ -126,8 +137,9 @@ airadb -s 192.168.1.100:5555 connect
 airadb -s 192.168.1.100:5555 info
 airadb -s 192.168.1.100 press home down enter
 
-# Capture screenshot directly to local PNG
+# Capture screenshot directly to local PNG, or a small JPEG scaled on the device
 airadb -s 192.168.1.100:5555 screencap screen.png
+airadb -s 192.168.1.100:5555 screencap --width 720 screen.jpg
 
 # Shell execution
 airadb -s 192.168.1.100:5555 shell "getprop ro.product.model"

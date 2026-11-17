@@ -1,6 +1,7 @@
-//! Installed apps with their names and icons. `pm` prints neither, so a
-//! 4 KB dex (`helper/`) runs on the device through `app_process` as the
-//! shell user and asks `PackageManager`. It is pushed on first use; when it
+//! What the shell cannot do: app names and icons (`pm` prints neither) and
+//! small screenshots. A 6 KB dex (`helper/`) runs on the device through
+//! `app_process` as the shell user and asks `PackageManager`, or scales a
+//! raw `screencap`. It is pushed on first use; when it
 //! cannot run, listing falls back to `pm` without names.
 
 use std::sync::LazyLock;
@@ -41,7 +42,7 @@ impl Device {
 
     /// The app's icon as a 128-pixel square PNG.
     pub async fn app_icon(&self, package: &PackageName) -> Result<Vec<u8>> {
-        let png = self.helper(&format!("icon {} 128", package.as_str())).await?;
+        let png = self.helper(None, &format!("icon {} 128", package.as_str())).await?;
         if png.starts_with(b"\x89PNG") {
             Ok(png)
         } else {
@@ -50,7 +51,7 @@ impl Device {
     }
 
     async fn list_apps(&self, all: bool) -> Result<Vec<App>> {
-        let parsed = match self.helper(if all { "apps all" } else { "apps" }).await {
+        let parsed = match self.helper(None, if all { "apps all" } else { "apps" }).await {
             Ok(out) => parse(&String::from_utf8_lossy(&out)),
             Err(e) if e.kind() == crate::ErrorKind::Unauthorized || e.kind() == crate::ErrorKind::Disconnected => {
                 return Err(e)
@@ -65,13 +66,31 @@ impl Device {
         Ok(apps)
     }
 
-    /// Run the helper; push it first if this device does not have it yet.
-    async fn helper(&self, args: &str) -> Result<Vec<u8>> {
+    /// A JPEG screenshot at most `max_width` pixels wide: the device scales
+    /// it, so a fraction of the full-size PNG crosses the network. Falls
+    /// back to [`screencap`](Device::screencap) (PNG) where the helper
+    /// cannot run.
+    pub async fn screenshot(&self, max_width: u32, quality: u8) -> Result<Vec<u8>> {
+        let args = format!("shot {} {}", max_width.max(1), quality.clamp(1, 100));
+        match self.helper(Some("screencap"), &args).await {
+            Ok(jpeg) if jpeg.starts_with(b"\xff\xd8\xff") => Ok(jpeg),
+            Err(e) if e.kind() == crate::ErrorKind::Unauthorized || e.kind() == crate::ErrorKind::Disconnected => Err(e),
+            other => {
+                tracing::debug!("helper screenshot unavailable, sending a full PNG: {:?}", other.map(|b| b.len()));
+                self.screencap().await
+            }
+        }
+    }
+
+    /// Run the helper, fed the output of `input` when given; push it first
+    /// if this device does not have it yet.
+    async fn helper(&self, input: Option<&str>, args: &str) -> Result<Vec<u8>> {
         let path = REMOTE.as_str();
-        let cmd = format!(
-            "if [ -f {path} ]; then CLASSPATH={path} exec app_process / airadb.Helper {args}; else echo {}; fi",
-            String::from_utf8_lossy(MISSING)
-        );
+        let run = match input {
+            Some(input) => format!("{input} | CLASSPATH={path} app_process / airadb.Helper {args}"),
+            None => format!("CLASSPATH={path} exec app_process / airadb.Helper {args}"),
+        };
+        let cmd = format!("if [ -f {path} ]; then {run}; else echo {}; fi", String::from_utf8_lossy(MISSING));
         let out = self.exec_raw(&cmd).await?;
         if out.trim_ascii() != MISSING {
             return Ok(out);
