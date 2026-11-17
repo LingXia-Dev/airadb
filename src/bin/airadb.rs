@@ -422,7 +422,9 @@ async fn run(cli: Cli) -> Result<()> {
         } else {
             println!("\nDiscovered {} ADB device(s):", found.len());
             for d in found {
-                let auth = if d.auth_required {
+                let auth = if d.unresponsive {
+                    "no reply: held by another host or hung, restart it"
+                } else if d.auth_required {
                     "auth required"
                 } else {
                     "open"

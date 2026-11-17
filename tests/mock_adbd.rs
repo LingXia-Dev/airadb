@@ -512,3 +512,35 @@ async fn discover_held(client: &Client) -> Vec<airadb::DiscoveredDevice> {
         .await
         .unwrap()
 }
+
+#[tokio::test]
+async fn discover_reports_a_silent_adb_port_as_unresponsive() {
+    // A held or hung adbd takes the connection and never answers. Only on
+    // 5555/9527: 5566 is left out (IoT gadgets listen there too).
+    let (Ok(adb), Ok(other)) =
+        (TcpListener::bind("127.0.0.1:5555").await, TcpListener::bind("127.0.0.1:5566").await)
+    else {
+        eprintln!("skipped: 5555 or 5566 in use");
+        return;
+    };
+    for listener in [adb, other] {
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+    }
+    let found = Client::new(key())
+        .discover()
+        .hosts([std::net::Ipv4Addr::LOCALHOST])
+        .ports([5555, 5566])
+        .mdns(false)
+        .probe_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].addr.port(), 5555);
+    assert!(found[0].unresponsive);
+}

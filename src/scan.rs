@@ -23,6 +23,9 @@ pub const DEFAULT_ADB_PORT: u16 = 5555;
 /// 5555 is standard Android adbd; 9527 is commonly used on Smart TV / OTT boxes (e.g. Hisilicon);
 /// 5566 is commonly used for secondary debug ports / emulator / cloud devices (aligned with mukeinstall).
 pub const DEFAULT_ADB_PORTS: &[u16] = &[5555, 9527, 5566];
+/// Ports where a silent listener is reported as an unresponsive adbd; 5566
+/// is left out (IoT gadgets listen there too).
+const SILENT_PORTS: &[u16] = &[5555, 9527];
 
 /// Information about a discovered ADB device on the local network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,17 @@ pub struct DiscoveredDevice {
     /// key); `false` means it accepted the connection without one, or this
     /// client already holds a connection to it.
     pub auth_required: bool,
+    /// Something on an ADB port took the connection but never answered the
+    /// handshake, on every try: adbd held by another host (old ones serve
+    /// one client) or hung. Restarting the device clears it. Only for ports
+    /// 5555 and 9527, where little else listens; nothing else is known.
+    pub unresponsive: bool,
+}
+
+impl DiscoveredDevice {
+    fn bare(addr: SocketAddr, auth_required: bool, unresponsive: bool) -> Self {
+        Self { addr, model: None, product: None, device: None, banner: String::new(), auth_required, unresponsive }
+    }
 }
 
 /// Helper to parse ADB banner properties such as `ro.product.model=...`.
@@ -69,22 +83,41 @@ fn parse_banner_props(banner: &str) -> (Option<String>, Option<String>, Option<S
     (model, product, device)
 }
 
-/// Probes a single target `addr` over TCP, sending an ADB `A_CNXN` handshake packet
-/// to verify whether an actual ADB daemon is listening.
-///
-/// Returns `Some(DiscoveredDevice)` if the target responds with `A_CNXN` or `A_AUTH`.
-pub(crate) async fn probe_adb_device(
+/// What one probe saw.
+pub(crate) enum Probe {
+    /// adbd answered with `A_CNXN` or `A_AUTH`.
+    Found(DiscoveredDevice),
+    /// The connection was taken, then nothing came back.
+    Silent,
+    /// The host is up (the port refused, or something else answered).
+    Other,
+    /// No sign of a host: the connect timed out or the host is down.
+    Nothing,
+}
+
+/// Probes a single target `addr` over TCP, sending an ADB `A_CNXN` handshake
+/// packet to verify whether an actual ADB daemon is listening.
+pub(crate) async fn probe_adb_device(addr: SocketAddr, timeout_dur: Duration) -> Probe {
+    let mut stream = match timeout(timeout_dur, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Probe::Other,
+        _ => return Probe::Nothing,
+    };
+    match handshake(&mut stream, addr, timeout_dur).await {
+        Ok(Some(found)) => Probe::Found(found),
+        Ok(None) => Probe::Other,
+        Err(()) => Probe::Silent,
+    }
+}
+
+/// `Err` when the reply never came (as opposed to a closed or foreign one).
+async fn handshake(
+    stream: &mut TcpStream,
     addr: SocketAddr,
     timeout_dur: Duration,
-) -> Option<DiscoveredDevice> {
-    // 1. Establish TCP connection with timeout.
-    // On lossy 2.4GHz WiFi (e.g. Android 5 TV boxes with 20% packet loss),
-    // allowing at least ~1000-1200ms lets the OS kernel perform a native SYN retransmission
-    // without flooding the wireless driver.
-    let mut stream = timeout(timeout_dur, TcpStream::connect(addr))
-        .await
-        .ok()?
-        .ok()?;
+) -> std::result::Result<Option<DiscoveredDevice>, ()> {
+    // The connect timeout (~1200ms) lets the kernel retransmit a SYN once on
+    // lossy 2.4GHz Wi-Fi without flooding the driver.
     let _ = stream.set_nodelay(true);
 
     // 2. Send initial A_CNXN packet
@@ -92,39 +125,25 @@ pub(crate) async fn probe_adb_device(
     let init_packet = AdbPacket::new(A_CNXN, A_VERSION_SKIP_CHECKSUM, 256 * 1024, connect_banner);
 
     let rw_timeout = Duration::from_millis(600).max(timeout_dur);
-    timeout(rw_timeout, write_packet(&mut stream, &init_packet))
-        .await
-        .ok()?
-        .ok()?;
+    if !matches!(timeout(rw_timeout, write_packet(stream, &init_packet)).await, Ok(Ok(()))) {
+        return Ok(None);
+    }
 
     // 3. Await ADB response packet
-    let response = timeout(rw_timeout, read_packet(&mut stream, false))
-        .await
-        .ok()?
-        .ok()?;
+    let response = match timeout(rw_timeout, read_packet(stream, false)).await {
+        Err(_) => return Err(()),
+        Ok(Err(_)) => return Ok(None),
+        Ok(Ok(r)) => r,
+    };
 
     if response.command == A_CNXN {
         let banner = String::from_utf8_lossy(&response.payload).to_string();
         let (model, product, device) = parse_banner_props(&banner);
-        Some(DiscoveredDevice {
-            addr,
-            model,
-            product,
-            device,
-            banner,
-            auth_required: false,
-        })
+        Ok(Some(DiscoveredDevice { addr, model, product, device, banner, auth_required: false, unresponsive: false }))
     } else if response.command == A_AUTH {
-        Some(DiscoveredDevice {
-            addr,
-            model: None,
-            product: None,
-            device: None,
-            banner: String::new(),
-            auth_required: true,
-        })
+        Ok(Some(DiscoveredDevice::bare(addr, true, false)))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -386,6 +405,7 @@ impl Discover {
             probe_timeout: self.probe_timeout,
             seen: Mutex::new(HashSet::new()),
             discovered_ips: Mutex::new(HashSet::new()),
+            silent: Mutex::new(HashSet::new()),
             limit: Semaphore::new(self.concurrency),
             subnets,
             explicit: ips.clone(),
@@ -419,31 +439,16 @@ impl Discover {
                 shared.discovered_ips.lock().unwrap().insert(addr.ip());
                 let banner = conn.device_banner().to_string();
                 let (model, product, device) = parse_banner_props(&banner);
-                let _ = tx.send(DiscoveredDevice { addr, model, product, device, banner, auth_required: false }).await;
+                let _ = tx.send(DiscoveredDevice { addr, model, product, device, banner, auth_required: false, unresponsive: false }).await;
             });
         }
-        let ips_vec: Vec<Ipv4Addr> = ips.into_iter().collect();
-        let driver_shared = shared.clone();
-        let driver_tx = tx.clone();
 
-        // Every port at once, then one retry of every port on the IPs still
-        // silent: lossy Wi-Fi (repeaters, 2.4GHz boxes) drops a first SYN on
-        // any port, not just 5555.
-        tasks.spawn(async move {
-            for _round in 0..2 {
-                let missing: Vec<Ipv4Addr> = {
-                    let disc = driver_shared.discovered_ips.lock().unwrap();
-                    ips_vec.iter().filter(|ip| !disc.contains(&IpAddr::V4(**ip))).copied().collect()
-                };
-                let mut round = JoinSet::new();
-                for &ip in &missing {
-                    for &port in &ports {
-                        round.spawn(probe(driver_shared.clone(), SocketAddr::new(IpAddr::V4(ip), port), driver_tx.clone()));
-                    }
-                }
-                while round.join_next().await.is_some() {}
-            }
-        });
+        // Per IP: every port at once, then one retry of all of them if none
+        // answered (lossy Wi-Fi, repeaters and 2.4GHz boxes, drops a first
+        // SYN on any port). The semaphore bounds sockets across all IPs.
+        for ip in ips {
+            tasks.spawn(probe_ip(shared.clone(), ip, ports.clone(), tx.clone()));
+        }
 
         drop(tx);
         Ok(Discovery {
@@ -515,6 +520,8 @@ struct Shared {
     probe_timeout: Duration,
     seen: Mutex<HashSet<SocketAddr>>,
     discovered_ips: Mutex<HashSet<IpAddr>>,
+    /// Addresses that took the connection and then said nothing.
+    silent: Mutex<HashSet<SocketAddr>>,
     limit: Semaphore,
     subnets: BTreeSet<Subnet>,
     explicit: BTreeSet<Ipv4Addr>,
@@ -527,28 +534,70 @@ impl Shared {
     }
 }
 
-async fn probe(shared: Arc<Shared>, addr: SocketAddr, tx: mpsc::Sender<DiscoveredDevice>) {
+async fn probe_ip(shared: Arc<Shared>, ip: Ipv4Addr, ports: Vec<u16>, tx: mpsc::Sender<DiscoveredDevice>) {
+    let answered = |s: &Shared| s.discovered_ips.lock().unwrap().contains(&IpAddr::V4(ip));
+    for round in 0..2 {
+        if answered(&shared) {
+            return;
+        }
+        let mut probes = JoinSet::new();
+        for &port in &ports {
+            probes.spawn(probe(shared.clone(), SocketAddr::new(IpAddr::V4(ip), port), tx.clone()));
+        }
+        let mut alive = false;
+        while let Some(r) = probes.join_next().await {
+            alive |= r.unwrap_or(false);
+        }
+        // An empty address only times out again; retrying it would hold up
+        // the hosts that are there.
+        if round == 0 && !alive {
+            return;
+        }
+    }
+    // Silent on an ADB port both times and nothing else answered: a held or
+    // hung adbd, worth telling the user about.
+    if answered(&shared) {
+        return;
+    }
+    let silent = {
+        let silent = shared.silent.lock().unwrap();
+        SILENT_PORTS.iter().map(|&p| SocketAddr::new(IpAddr::V4(ip), p)).find(|a| silent.contains(a))
+    };
+    if let Some(addr) = silent {
+        let _ = tx.send(DiscoveredDevice::bare(addr, false, true)).await;
+    }
+}
+
+/// `true` when the host showed signs of life (or was already found).
+async fn probe(shared: Arc<Shared>, addr: SocketAddr, tx: mpsc::Sender<DiscoveredDevice>) -> bool {
     // If an ADB device has already responded on this IP (e.g. standard port 5555),
     // skip probing secondary ports on the same host to avoid redundant load and duplicate reports.
     if shared.discovered_ips.lock().unwrap().contains(&addr.ip()) {
-        return;
+        return true;
     }
     let Ok(_permit) = shared.limit.acquire().await else {
-        return;
+        return true;
     };
     if shared.seen.lock().unwrap().contains(&addr) {
-        return;
+        return true;
     }
     if shared.discovered_ips.lock().unwrap().contains(&addr.ip()) {
-        return;
+        return true;
     }
-    let Some(found) = probe_adb_device(addr, shared.probe_timeout).await else {
-        return;
+    let found = match probe_adb_device(addr, shared.probe_timeout).await {
+        Probe::Found(found) => found,
+        Probe::Silent => {
+            shared.silent.lock().unwrap().insert(addr);
+            return true;
+        }
+        Probe::Other => return true,
+        Probe::Nothing => return false,
     };
     if shared.seen.lock().unwrap().insert(addr) {
         shared.discovered_ips.lock().unwrap().insert(addr.ip());
         let _ = tx.send(found).await;
     }
+    true
 }
 
 async fn mdns_query(
