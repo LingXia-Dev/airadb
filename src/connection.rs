@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -53,6 +53,8 @@ pub struct AdbConnection {
     streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     writer_tx: mpsc::Sender<AdbPacket>,
     connected: Arc<AtomicBool>,
+    /// When the device last sent anything.
+    last_rx: Arc<std::sync::Mutex<Instant>>,
     tasks: [JoinHandle<()>; 2],
 }
 
@@ -164,6 +166,7 @@ impl AdbConnection {
         let (writer_tx, mut writer_rx) = mpsc::channel::<AdbPacket>(128);
         let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(true));
+        let last_rx = Arc::new(std::sync::Mutex::new(Instant::now()));
 
         let writer_connected = connected.clone();
         let writer = tokio::spawn(async move {
@@ -180,6 +183,7 @@ impl AdbConnection {
         let reader_streams = streams.clone();
         let reader_tx = writer_tx.clone();
         let reader_connected = connected.clone();
+        let reader_last_rx = last_rx.clone();
         let skip_checksum = protocol_version >= A_VERSION_SKIP_CHECKSUM;
         let reader = tokio::spawn(async move {
             loop {
@@ -191,6 +195,7 @@ impl AdbConnection {
                     }
                 };
                 trace!("recv {packet:?}");
+                *reader_last_rx.lock().unwrap() = Instant::now();
                 let (remote_id, local_id) = (packet.arg0, packet.arg1);
                 match packet.command {
                     A_OKAY => {
@@ -242,6 +247,7 @@ impl AdbConnection {
             streams,
             writer_tx,
             connected,
+            last_rx,
             tasks: [writer, reader],
         })
     }
@@ -275,8 +281,25 @@ impl AdbConnection {
         fail_all(&self.streams, "connection shut down").await;
     }
 
+    /// Whether the device still answers: it sent something within `limit`,
+    /// or opens a stream within `limit`. A peer that vanished without a FIN
+    /// (power cut, Wi-Fi gone) still looks connected until keepalive fires.
+    pub(crate) async fn answers(&self, limit: Duration) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
+        if self.last_rx.lock().unwrap().elapsed() < limit {
+            return true;
+        }
+        self.open_within("sync:", limit).await.is_ok()
+    }
+
     /// Opens a multiplexed stream to a destination service (e.g. `shell:...`, `sync:`, `exec:...`).
     pub async fn open_stream(&self, destination: &str) -> Result<AdbStream> {
+        self.open_within(destination, self.open_timeout).await
+    }
+
+    async fn open_within(&self, destination: &str, limit: Duration) -> Result<AdbStream> {
         if !self.is_connected() {
             return Err(Error::disconnected());
         }
@@ -301,7 +324,7 @@ impl AdbConnection {
             .await
             .map_err(|_| Error::disconnected())?;
 
-        let outcome = timeout(self.open_timeout, open_rx).await;
+        let outcome = timeout(limit, open_rx).await;
         let remote_id = match outcome {
             Ok(Ok(Ok(id))) => id,
             other => {
@@ -309,7 +332,7 @@ impl AdbConnection {
                 let service = destination.split(':').next().unwrap_or(destination);
                 return Err(match other {
                     Ok(Ok(Err(msg))) => Error::rejected(format!("service '{service}:' refused: {msg}")),
-                    Err(_) => Error::timeout(format!("service '{service}:' did not open within {:?}", self.open_timeout)),
+                    Err(_) => Error::timeout(format!("service '{service}:' did not open within {limit:?}")),
                     _ => Error::disconnected(),
                 });
             }

@@ -36,6 +36,8 @@ struct State {
     connections: usize,
     pubkey_offered: bool,
     trusted: Vec<Vec<u8>>, // android-format public keys
+    /// Gone without a FIN (power cut): the socket stays open, nothing answers.
+    frozen: bool,
 }
 
 #[derive(Clone)]
@@ -70,6 +72,10 @@ impl Mock {
 
     fn commands(&self) -> Vec<String> {
         self.state.lock().unwrap().commands.clone()
+    }
+
+    fn freeze(&self) {
+        self.state.lock().unwrap().frozen = true;
     }
 
     fn connections(&self) -> usize {
@@ -162,6 +168,9 @@ async fn serve(mut sock: TcpStream, state: Arc<State2>, on_pubkey: OnPubkey, scr
     let mut syncs: HashMap<u32, SyncStream> = HashMap::new();
     let mut next_id = 1000u32;
     while let Ok(p) = read_packet(&mut rd, false).await {
+        if state.lock().unwrap().frozen {
+            continue;
+        }
         match p.command {
             A_OPEN => {
                 let (local, remote) = (p.arg0, next_id);
@@ -466,17 +475,40 @@ async fn discover_reports_live_connections_without_probing() {
 
     // Old adbd takes one client at a time: a device we hold must still be
     // found, from our connection, with no second one opened. Port 1 holds
-    // nothing, so only that connection can report it.
-    let found = client
-        .discover()
-        .hosts([std::net::Ipv4Addr::LOCALHOST])
-        .ports([1])
-        .mdns(false)
-        .timeout(Duration::from_secs(2))
-        .await
-        .unwrap();
+    // nothing, so only that connection can report it. Quiet for longer than
+    // the probe timeout, so the connection is pinged.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let found = discover_held(&client).await;
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].addr, mock.addr);
     assert!(found[0].banner.starts_with("device::"), "{}", found[0].banner);
     assert_eq!(mock.connections(), 1);
+}
+
+#[tokio::test]
+async fn discover_skips_a_held_connection_that_stopped_answering() {
+    let mock = Mock::start(OnPubkey::Accept).await;
+    let k = key();
+    mock.trust(&k);
+    let client = Client::new(k);
+    let dev = client.device(mock.addr);
+    dev.connect().await.unwrap();
+
+    // Power cut: no FIN, so the socket still looks connected.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    mock.freeze();
+    assert!(dev.is_connected().await);
+    assert!(discover_held(&client).await.is_empty());
+}
+
+async fn discover_held(client: &Client) -> Vec<airadb::DiscoveredDevice> {
+    client
+        .discover()
+        .hosts([std::net::Ipv4Addr::LOCALHOST])
+        .ports([1])
+        .mdns(false)
+        .probe_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_secs(2))
+        .await
+        .unwrap()
 }
