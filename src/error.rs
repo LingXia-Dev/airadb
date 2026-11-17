@@ -24,6 +24,8 @@ pub enum ErrorKind {
     InstallFailed,
     /// The package (or its icon) is not on the device.
     NotFound,
+    /// The package is part of the firmware: it cannot be uninstalled.
+    SystemApp,
     /// A caller-supplied argument is malformed.
     InvalidArg,
     /// Something on the wire did not follow the ADB protocol.
@@ -47,6 +49,7 @@ impl ErrorKind {
             Self::Rejected => "rejected",
             Self::InstallFailed => "install failed",
             Self::NotFound => "not found",
+            Self::SystemApp => "system app",
             Self::InvalidArg => "invalid argument",
             Self::Protocol => "protocol",
             Self::Key => "key",

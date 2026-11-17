@@ -430,9 +430,22 @@ impl Device {
         expect_success(&out, ErrorKind::Rejected, "pm clear")
     }
 
+    /// Uninstall. A system app fails with [`ErrorKind::SystemApp`].
     pub async fn uninstall(&self, package: &PackageName) -> Result<()> {
         let out = self.shell("pm").arg("uninstall").arg(package.as_str()).await?;
-        expect_success(&out, ErrorKind::Rejected, "pm uninstall")
+        let failed = match expect_success(&out, ErrorKind::Rejected, "pm uninstall") {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        // pm says only "DELETE_FAILED_INTERNAL_ERROR" (or similar) for these.
+        let system = self.shell("pm").args(["list", "packages", "-s"]).await.unwrap_or_default();
+        if system.lines().any(|l| l.trim().strip_prefix("package:") == Some(package.as_str())) {
+            return Err(Error::new(
+                ErrorKind::SystemApp,
+                format!("'{package}' is a system app; the device does not allow uninstalling it"),
+            ));
+        }
+        Err(failed)
     }
 
     /// Uninstall but keep data and cache (`pm uninstall -k`).
