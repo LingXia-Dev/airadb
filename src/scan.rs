@@ -426,66 +426,22 @@ impl Discover {
         let driver_shared = shared.clone();
         let driver_tx = tx.clone();
 
-        // Staged scanning coordinator task:
+        // Every port at once, then one retry of every port on the IPs still
+        // silent: lossy Wi-Fi (repeaters, 2.4GHz boxes) drops a first SYN on
+        // any port, not just 5555.
         tasks.spawn(async move {
-            // Phase 1: Probe default primary port (5555) on all targets in parallel.
-            if ports.contains(&DEFAULT_ADB_PORT) {
-                let mut phase1 = JoinSet::new();
-                for &ip in &ips_vec {
-                    phase1.spawn(probe(
-                        driver_shared.clone(),
-                        SocketAddr::new(IpAddr::V4(ip), DEFAULT_ADB_PORT),
-                        driver_tx.clone(),
-                    ));
-                }
-                while phase1.join_next().await.is_some() {}
-
-                // Phase 2: Second-chance retry on port 5555 ONLY for targets not yet discovered.
-                // This specifically handles lossy 2.4GHz WiFi (e.g. Android 5 TV boxes) where initial SYNs dropped.
+            for _round in 0..2 {
                 let missing: Vec<Ipv4Addr> = {
                     let disc = driver_shared.discovered_ips.lock().unwrap();
-                    ips_vec
-                        .iter()
-                        .filter(|ip| !disc.contains(&IpAddr::V4(**ip)))
-                        .copied()
-                        .collect()
+                    ips_vec.iter().filter(|ip| !disc.contains(&IpAddr::V4(**ip))).copied().collect()
                 };
-                if !missing.is_empty() {
-                    let mut phase2 = JoinSet::new();
-                    for ip in missing {
-                        phase2.spawn(probe(
-                            driver_shared.clone(),
-                            SocketAddr::new(IpAddr::V4(ip), DEFAULT_ADB_PORT),
-                            driver_tx.clone(),
-                        ));
-                    }
-                    while phase2.join_next().await.is_some() {}
-                }
-            }
-
-            // Phase 3: Secondary ports (e.g. 9527, 5566) ONLY for targets not yet discovered.
-            let missing: Vec<Ipv4Addr> = {
-                let disc = driver_shared.discovered_ips.lock().unwrap();
-                ips_vec
-                    .iter()
-                    .filter(|ip| !disc.contains(&IpAddr::V4(**ip)))
-                    .copied()
-                    .collect()
-            };
-            if !missing.is_empty() {
-                let mut phase3 = JoinSet::new();
-                for &port in &ports {
-                    if port != DEFAULT_ADB_PORT {
-                        for &ip in &missing {
-                            phase3.spawn(probe(
-                                driver_shared.clone(),
-                                SocketAddr::new(IpAddr::V4(ip), port),
-                                driver_tx.clone(),
-                            ));
-                        }
+                let mut round = JoinSet::new();
+                for &ip in &missing {
+                    for &port in &ports {
+                        round.spawn(probe(driver_shared.clone(), SocketAddr::new(IpAddr::V4(ip), port), driver_tx.clone()));
                     }
                 }
-                while phase3.join_next().await.is_some() {}
+                while round.join_next().await.is_some() {}
             }
         });
 
