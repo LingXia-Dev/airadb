@@ -38,7 +38,8 @@ pub struct DiscoveredDevice {
     /// Raw banner string returned by the device.
     pub banner: String,
     /// The device answered with an auth challenge (it may still trust our
-    /// key); `false` means it accepted the connection without one.
+    /// key); `false` means it accepted the connection without one, or this
+    /// client already holds a connection to it.
     pub auth_required: bool,
 }
 
@@ -276,6 +277,9 @@ pub struct Discover {
     probe_timeout: Duration,
     concurrency: usize,
     mdns: bool,
+    /// Devices this client is connected to: reported from that connection,
+    /// never probed (a single-client adbd would refuse the probe).
+    live: Vec<crate::Device>,
 }
 
 impl Default for Discover {
@@ -294,6 +298,7 @@ impl Discover {
             probe_timeout: Duration::from_millis(1200),
             concurrency: 256,
             mdns: true,
+            live: Vec::new(),
         }
     }
 
@@ -341,6 +346,11 @@ impl Discover {
     /// Also ask mDNS for `_adb._tcp.local` (default on).
     pub fn mdns(mut self, enabled: bool) -> Self {
         self.mdns = enabled;
+        self
+    }
+
+    pub(crate) fn live(mut self, devices: Vec<crate::Device>) -> Self {
+        self.live = devices;
         self
     }
 
@@ -393,12 +403,29 @@ impl Discover {
         }
 
         let ports = self.ports.clone();
+        let live: Vec<crate::Device> = self
+            .live
+            .into_iter()
+            .filter(|d| matches!(d.addr().ip(), IpAddr::V4(ip) if shared.wanted(ip)))
+            .collect();
         let ips_vec: Vec<Ipv4Addr> = ips.into_iter().collect();
         let driver_shared = shared.clone();
         let driver_tx = tx.clone();
 
         // Staged scanning coordinator task:
         tasks.spawn(async move {
+            // Phase 0: devices we are already connected to.
+            for d in live {
+                let Some(banner) = d.live_banner() else { continue };
+                let addr = d.addr();
+                if driver_shared.seen.lock().unwrap().insert(addr) {
+                    driver_shared.discovered_ips.lock().unwrap().insert(addr.ip());
+                    let (model, product, device) = parse_banner_props(&banner);
+                    let found = DiscoveredDevice { addr, model, product, device, banner, auth_required: false };
+                    let _ = driver_tx.send(found).await;
+                }
+            }
+
             // Phase 1: Probe default primary port (5555) on all targets in parallel.
             if ports.contains(&DEFAULT_ADB_PORT) {
                 let mut phase1 = JoinSet::new();

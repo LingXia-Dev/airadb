@@ -453,3 +453,30 @@ async fn silent_peer_times_out_and_closed_port_is_unreachable() {
     assert_eq!(err.kind(), ErrorKind::Unreachable);
     assert!(err.is_retryable());
 }
+
+#[tokio::test]
+async fn discover_reports_live_connections_without_probing() {
+    let mock = Mock::start(OnPubkey::Accept).await;
+    let k = key();
+    mock.trust(&k);
+    let client = Client::new(k);
+    let dev = client.device(mock.addr);
+    dev.connect().await.unwrap();
+    assert_eq!(mock.connections(), 1);
+
+    // Old adbd takes one client at a time: a device we hold must still be
+    // found, from our connection, with no second one opened. Port 1 holds
+    // nothing, so only that connection can report it.
+    let found = client
+        .discover()
+        .hosts([std::net::Ipv4Addr::LOCALHOST])
+        .ports([1])
+        .mdns(false)
+        .timeout(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].addr, mock.addr);
+    assert!(found[0].banner.starts_with("device::"), "{}", found[0].banner);
+    assert_eq!(mock.connections(), 1);
+}

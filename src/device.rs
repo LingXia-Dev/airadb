@@ -254,6 +254,13 @@ impl Device {
         }
     }
 
+    /// The banner of the connection this handle already has, if it is up.
+    /// Never waits: a handle busy connecting is left to the probe.
+    pub(crate) fn live_banner(&self) -> Option<String> {
+        let conn = self.inner.conn.try_lock().ok()?;
+        conn.as_ref().filter(|c| c.is_connected()).map(|c| c.device_banner().to_string())
+    }
+
     pub async fn is_connected(&self) -> bool {
         self.inner.conn.lock().await.as_ref().is_some_and(|c| c.is_connected())
     }

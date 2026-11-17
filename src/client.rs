@@ -104,7 +104,8 @@ impl Client {
 
     /// Find ADB endpoints on the local network. See [`Discover`].
     pub fn discover(&self) -> Discover {
-        Discover::new()
+        let live = self.inner.devices.lock().unwrap().values().filter_map(Weak::upgrade).map(|inner| Device { inner }).collect();
+        Discover::new().live(live)
     }
 
     pub fn key(&self) -> &KeyPair {
